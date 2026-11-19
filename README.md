@@ -14,6 +14,8 @@ Bot trading spot Binance untuk banyak pair sekaligus. Daftar pair diatur manual 
 **Exit**:
 - Take profit dinamis 1–3%: `1.5 × ATR% 1H` saat entry, dibatasi 1%–3% (pasar tenang → ~1%, pasar bergejolak → mendekati 3%)
 - Stop loss 2% → pair masuk status `cooldown` (default 240 menit)
+- **Mode live memakai order OCO di Binance**: TP berupa `LIMIT_MAKER`, SL berupa `STOP_LOSS` (market saat harga menyentuh stop). Begitu salah satu terisi, yang lain otomatis batal, dan posisi tetap terlindungi walau bot/VPS mati. Bot hanya memantau statusnya dan mengirim notifikasi Telegram saat TP/SL terisi.
+- Bila OCO gagal dipasang (error API, pair tidak mendukung OCO), bot memantau harga sendiri, memberi peringatan Telegram, dan mencoba memasang OCO lagi tiap 5 menit. Atur `USE_OCO=false` untuk mematikan fitur ini.
 
 **Anti beli beruntun saat sideways** (semuanya aktif bersamaan):
 - Setelah trade (entry/exit), RSI 15m harus pulih ≥ `REARM_LEVEL` (50) dulu sebelum sinyal baru dianggap valid
@@ -55,7 +57,9 @@ Atau pakai systemd agar otomatis menyala setelah reboot. State tersimpan di `sta
 
 ## Catatan penting
 
-- SL/TP dipantau oleh bot (cek harga tiap `LOOP_SECONDS`), **bukan** order OCO di sisi Binance. Bila bot/VPS mati saat posisi terbuka, tidak ada proteksi otomatis.
+- Selama OCO aktif, koin yang dibeli bot **terkunci** di order tersebut. Bila ingin menjual manual, batalkan OCO-nya dulu di Binance (bot akan mendeteksi dan menyesuaikan). Order OCO hanya melindungi posisi yang dibuat bot.
+- SL berjenis market: terisi hampir pasti, tetapi harga eksekusi bisa lebih rendah dari harga stop saat pasar jatuh cepat (slippage).
+- Mode `DRY_RUN` tidak mengirim order apa pun; TP/SL disimulasikan lewat pemantauan harga. Alur OCO sungguhan baru bisa dicoba di `BINANCE_TESTNET=true` atau live.
 - Syarat entry sengaja ketat, jadi sinyal bisa jarang muncul (RSI 1H masih < 30 saat RSI 15m sudah menembus 32 itu kondisi yang jarang). Longgarkan lewat `RSI_1H_MAX` / `RSI_4H_MAX` bila perlu.
 - Rasio risiko/imbalan: TP 1% vs SL 2% berarti win rate harus tinggi agar impas, apalagi dengan fee. Pantau hasil di mode DRY RUN dulu.
 - Ini bukan nasihat keuangan; trading crypto berisiko kehilangan modal.
