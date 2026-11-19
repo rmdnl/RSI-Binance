@@ -40,6 +40,18 @@ python bot.py
 2. `BINANCE_TESTNET=true` + `DRY_RUN=false` bila ingin menguji alur order sungguhan
 3. Live dengan modal kecil
 
+## Backtest (opsional)
+
+`backtest.py` menjalankan logika yang sama pada data historis Binance (publik, tanpa API key) dan membandingkan beberapa kombinasi `RSI_4H_MAX/RSI_1H_MAX`. Taruh di folder yang sama dengan `bot.py`.
+
+```bash
+python backtest.py --symbol NEARUSDT --days 90
+python backtest.py --symbol NEARUSDT --days 180 --combos 30/30,35/40,40/35,40/40
+python backtest.py --symbol NEARUSDT --days 180 --closed     # meniru CONTEXT_USE_CLOSED=true
+```
+
+Hasil historis tidak menjamin hasil ke depan, jadi pakai untuk membandingkan kombinasi, bukan memprediksi profit.
+
 ## API key Binance
 
 - Aktifkan hanya **Spot & Margin Trading**, matikan Withdrawals
