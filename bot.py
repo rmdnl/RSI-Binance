@@ -14,6 +14,10 @@ Manajemen posisi:
   - Ukuran posisi : POSITION_PCT % dari equity (default 30%)
   - Take profit   : dinamis 1-3% (berdasarkan volatilitas ATR 1H saat entry)
   - Stop loss     : SL_PCT % (default 2%) -> pair masuk status COOLDOWN
+  - Eksekusi exit : mode live memasang order OCO di Binance (TP = LIMIT_MAKER, SL = STOP_LOSS),
+                    sehingga posisi tetap terlindungi walau bot/VPS mati. Bila OCO gagal dipasang,
+                    bot memantau harga sendiri dan mencoba memasang OCO lagi tiap 5 menit.
+                    Mode DRY_RUN mensimulasikan TP/SL lewat pemantauan harga.
   - Anti-whipsaw  : lockout re-entry, wajib "reset" RSI 15m >= REARM_LEVEL setelah trade,
                     dan batas jumlah entry per pair per jendela waktu
 
@@ -89,6 +93,7 @@ class Config:
     tp_max: float
     tp_atr_mult: float
     sl_pct: float
+    use_oco: bool
     cooldown_min: float
     lockout_min: float
     max_entries_window: int
@@ -125,6 +130,7 @@ class Config:
             tp_max=_f("TP_MAX_PCT", 3.0),
             tp_atr_mult=_f("TP_ATR_MULT", 1.5),
             sl_pct=_f("SL_PCT", 2.0),
+            use_oco=_b("USE_OCO", True),
             cooldown_min=_f("COOLDOWN_MINUTES", 240),
             lockout_min=_f("REENTRY_LOCKOUT_MINUTES", 120),
             max_entries_window=_i("MAX_ENTRIES_PER_WINDOW", 2),
@@ -333,6 +339,89 @@ class LiveBroker:
                 proceeds -= float(fee["cost"])
         return {"qty": filled, "price": price, "proceeds": proceeds}
 
+    # ---- OCO: TP + SL dieksekusi di sisi Binance ------------------------------
+    def oco_supported(self, sym: str) -> bool:
+        info = self.ex.market(sym).get("info") or {}
+        if info.get("ocoAllowed") is False:
+            return False
+        types = info.get("orderTypes") or []
+        return not types or "LIMIT_MAKER" in types
+
+    def place_oco(self, sym: str, qty: float, tp_price: float, sl_stop: float) -> dict:
+        """SELL OCO: sisi atas LIMIT_MAKER (TP), sisi bawah STOP_LOSS (SL, market saat terpicu)."""
+        if not self.oco_supported(sym):
+            raise RuntimeError(f"{sym} tidak mendukung OCO (ocoAllowed/LIMIT_MAKER)")
+        info = self.ex.market(sym).get("info") or {}
+        types = info.get("orderTypes") or []
+        q = self.ex.amount_to_precision(sym, min(qty, self.base_free(sym)))
+        if float(q) <= 0:
+            raise RuntimeError(f"Qty OCO {sym} nol setelah pembulatan")
+        pp = lambda x: self.ex.price_to_precision(sym, x)  # noqa: E731
+        params = {
+            "symbol": self.ex.market_id(sym),
+            "side": "SELL",
+            "quantity": q,
+            "aboveType": "LIMIT_MAKER",
+            "abovePrice": pp(tp_price),
+        }
+        if types and "STOP_LOSS" not in types and "STOP_LOSS_LIMIT" in types:
+            params.update(belowType="STOP_LOSS_LIMIT", belowStopPrice=pp(sl_stop),
+                          belowPrice=pp(sl_stop * 0.997), belowTimeInForce="GTC")
+        else:
+            params.update(belowType="STOP_LOSS", belowStopPrice=pp(sl_stop))
+        res = self.ex.request("orderList/oco", "private", "POST", params)
+        tp_id = sl_id = None
+        for r in res.get("orderReports") or []:
+            if str(r.get("type", "")).upper().startswith("STOP_LOSS"):
+                sl_id = str(r["orderId"])
+            else:
+                tp_id = str(r["orderId"])
+        if tp_id and sl_id:
+            return {"list_id": str(res.get("orderListId")), "tp_id": tp_id, "sl_id": sl_id}
+        found = self.find_oco(sym)  # respons tidak lengkap: cari order yang baru terpasang
+        if not found:
+            raise RuntimeError(f"Respons OCO {sym} tidak lengkap dan order tidak ditemukan")
+        return found
+
+    def find_oco(self, sym: str) -> Optional[dict]:
+        """Cari pasangan OCO SELL yang sedang aktif untuk pair ini (adopsi bila sudah ada)."""
+        groups: Dict[str, dict] = {}
+        for o in self.ex.fetch_open_orders(sym):
+            info = o.get("info") or {}
+            lid = str(info.get("orderListId", -1))
+            if lid in ("-1", "None", ""):
+                continue
+            if str(info.get("side", "")).upper() != "SELL":
+                continue
+            t = str(info.get("type", "")).upper()
+            g = groups.setdefault(lid, {})
+            if t.startswith("STOP_LOSS"):
+                g["sl_id"] = str(o["id"])
+            elif t.startswith(("LIMIT_MAKER", "TAKE_PROFIT")):
+                g["tp_id"] = str(o["id"])
+        for lid, g in groups.items():
+            if "tp_id" in g and "sl_id" in g:
+                return {"list_id": lid, **g}
+        return None
+
+    def poll_oco(self, sym: str, oco: dict) -> tuple:
+        """Return ('active'|'filled'|'gone', hasil). 'filled' memuat leg TP/SL yang terisi."""
+        ids = {str(oco["tp_id"]), str(oco["sl_id"])}
+        if ids & {str(o["id"]) for o in self.ex.fetch_open_orders(sym)}:
+            return "active", None
+        for leg, oid in (("SL", oco["sl_id"]), ("TP", oco["tp_id"])):
+            o = self.ex.fetch_order(str(oid), sym)
+            filled = float(o.get("filled") or 0)
+            if filled > 0:
+                price = float(o.get("average") or o.get("price") or 0)
+                proceeds = float(o.get("cost") or filled * price)
+                fees = o.get("fees") or ([o["fee"]] if o.get("fee") else [])
+                for fee in fees:
+                    if fee and fee.get("currency") == self.quote and fee.get("cost"):
+                        proceeds -= float(fee["cost"])
+                return "filled", {"leg": leg, "qty": filled, "price": price, "proceeds": proceeds}
+        return "gone", None
+
 
 # =============================================================================
 # Bot
@@ -404,25 +493,81 @@ class Bot:
 
     def _check_exit(self, sym: str, st: dict, now: float) -> None:
         pos = st["position"]
+        if pos.get("oco"):  # TP/SL dijaga Binance lewat OCO; bot hanya memantau statusnya
+            self._check_oco(sym, st, pos, now)
+            return
         price = self.last_price(sym)
         if price <= pos["sl"]:
             self._exit(sym, st, "SL", price, now)
-        elif price >= pos["tp"]:
+            return
+        if price >= pos["tp"]:
             self._exit(sym, st, "TP", price, now)
+            return
+        if now >= pos.get("oco_retry_at", 0):
+            self._arm_oco(sym, st, pos, now)
+
+    def _arm_oco(self, sym: str, st: dict, pos: dict, now: float) -> bool:
+        """Pasang (atau adopsi yang sudah ada) order OCO TP+SL di Binance. Hanya mode live."""
+        cfg = self.cfg
+        if cfg.dry_run or not cfg.use_oco or not hasattr(self.broker, "place_oco"):
+            return False
+        try:
+            oco = self.broker.find_oco(sym) or self.broker.place_oco(sym, pos["qty"], pos["tp"], pos["sl"])
+        except Exception as e:
+            pos["oco"] = None
+            pos["oco_retry_at"] = now + 300
+            log.warning("%s: gagal memasang OCO (%s: %s)", sym, type(e).__name__, str(e)[:200])
+            if not pos.get("oco_warned"):
+                pos["oco_warned"] = True
+                self.notifier.send(
+                    f"⚠️ Gagal memasang OCO {sym} ({type(e).__name__}: {str(e)[:150]}).\n"
+                    f"Bot memantau TP/SL sendiri dan mencoba lagi tiap 5 menit."
+                )
+            self.save()
+            return False
+        pos["oco"] = oco
+        pos.pop("oco_retry_at", None)
+        if pos.pop("oco_warned", False):
+            self.notify(f"✅ OCO {sym} akhirnya terpasang di Binance.")
+        self.save()
+        return True
+
+    def _check_oco(self, sym: str, st: dict, pos: dict, now: float) -> None:
+        status, res = self.broker.poll_oco(sym, pos["oco"])
+        if status == "active":
+            return
+        if status == "filled":
+            self._record_exit(sym, st, res["leg"], res, now)
+            return
+        # OCO sudah tidak ada tanpa ada yang terisi (dibatalkan manual / kedaluwarsa)
+        if self.broker.base_free(sym) < pos["qty"] * 0.5:
+            st.update(status="idle", position=None, last_trade_ts=now, need_reset=True)
+            self.save()
+            self.notify(f"⚠️ {sym}: OCO hilang dan saldo koin tidak ada (dijual manual?). Posisi direset ke idle.")
+            return
+        pos["oco"] = None
+        pos["oco_retry_at"] = 0
+        self.save()
+        self.notify(f"⚠️ OCO {sym} tidak aktif lagi (dibatalkan/kedaluwarsa). "
+                    f"Bot memantau TP/SL sendiri dan memasang ulang OCO.")
 
     def _exit(self, sym: str, st: dict, reason: str, price: float, now: float) -> None:
         pos = st["position"]
         res = self.broker.sell(sym, pos["qty"], price)
-        st["position"] = None
-        st["last_trade_ts"] = now
-        st["need_reset"] = True
-
         if res is None:
-            st["status"] = "idle"
+            st.update(status="idle", position=None, last_trade_ts=now, need_reset=True)
             self.save()
             self.notify(f"⚠️ {sym}: saldo koin tidak ditemukan saat {reason} (mungkin sudah dijual manual). "
                         f"Status posisi direset ke idle.")
             return
+        self._record_exit(sym, st, reason, res, now)
+
+    def _record_exit(self, sym: str, st: dict, reason: str, res: dict, now: float) -> None:
+        """Catat hasil exit (market sell oleh bot, atau leg OCO yang terisi di Binance)."""
+        pos = st["position"]
+        st["position"] = None
+        st["last_trade_ts"] = now
+        st["need_reset"] = True
 
         sold = min(res["qty"], pos["qty"])
         cost_part = pos["cost"] * (sold / pos["qty"]) if pos["qty"] > 0 else pos["cost"]
@@ -561,16 +706,25 @@ class Bot:
             "tp": entry * (1 + tp_pct / 100.0),
             "tp_pct": tp_pct,
             "opened_at": now,
+            "oco": None,
         }
         st["position"] = pos
         st["status"] = "in_position"
         st["last_trade_ts"] = now
         st["entries"].append(now)
         self.save()
+        armed = self._arm_oco(sym, st, pos, now)
+        if armed:
+            exit_mode = "OCO terpasang di Binance (TP + SL)"
+        elif cfg.dry_run:
+            exit_mode = "simulasi, dipantau bot"
+        else:
+            exit_mode = "dipantau bot (OCO belum terpasang, lihat peringatan)"
         self.notify(
             f"🟢 BUY {sym}{' [DRY RUN]' if cfg.dry_run else ''}\n"
             f"Harga {fp(entry)} | Nilai {res['cost']:.2f} {cfg.quote} ({cfg.position_pct:g}% equity)\n"
             f"TP {fp(pos['tp'])} (+{tp_pct:g}%) | SL {fp(pos['sl'])} (-{cfg.sl_pct:g}%)\n"
+            f"Exit: {exit_mode}\n"
             f"RSI 4H {r4:.1f} | 1H {r1:.1f} | 15m {prev:.1f}→{last:.1f}"
         )
 
@@ -594,7 +748,8 @@ class Bot:
             f"Pair: {', '.join(cfg.symbols)}\n"
             f"Entry: RSI 4H<{cfg.rsi_4h_max:g} & 1H<{cfg.rsi_1h_max:g}, 15m <{cfg.rsi_oversold:g} → >{cfg.rsi_trigger:g}\n"
             f"Posisi {cfg.position_pct:g}% equity | TP {cfg.tp_min:g}-{cfg.tp_max:g}% | SL {cfg.sl_pct:g}% | "
-            f"cooldown {cfg.cooldown_min:g} mnt"
+            f"cooldown {cfg.cooldown_min:g} mnt\n"
+            f"Exit: {'OCO di Binance' if (cfg.use_oco and not cfg.dry_run) else 'dipantau bot'}"
         )
         while self.running:
             for sym in cfg.symbols:
@@ -612,7 +767,8 @@ class Bot:
             while self.running and time.time() < end:
                 time.sleep(min(1.0, max(0.0, end - time.time())))
         self.save()
-        self.notify("🛑 Bot dihentikan. Posisi terbuka (jika ada) TIDAK otomatis dijual.")
+        self.notify("🛑 Bot dihentikan. Posisi terbuka tidak otomatis dijual. Posisi dengan OCO tetap "
+                    "dijaga Binance; posisi tanpa OCO tidak terpantau selama bot mati.")
 
 
 # =============================================================================
@@ -729,7 +885,8 @@ def main() -> int:
     # Rekonsiliasi: posisi di state tapi koinnya sudah tidak ada di akun (mis. dijual manual)
     if not cfg.dry_run:
         for sym, st in state["symbols"].items():
-            if st["position"] and broker.base_free(sym) < st["position"]["qty"] * 0.5:
+            # Posisi ber-OCO dicek statusnya di loop utama (koinnya terkunci di order, bukan "free")
+            if st["position"] and not st["position"].get("oco") and broker.base_free(sym) < st["position"]["qty"] * 0.5:
                 st.update(status="idle", position=None, need_reset=True, last_trade_ts=time.time())
                 bot.notify(f"⚠️ {sym}: saldo koin tidak sesuai state, posisi direset ke idle.")
 
