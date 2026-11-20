@@ -4,7 +4,7 @@ import unittest
 from decimal import Decimal, ROUND_DOWN
 from unittest.mock import patch
 
-from bot import Bot, Config, LiveBroker, closed_only, rsi_series
+from bot import Bot, Config, LiveBroker, closed_only, load_state, rsi_series
 
 
 class FakeExchange:
@@ -101,8 +101,26 @@ class BrokerSafetyTests(unittest.TestCase):
         self.assertEqual(ex.fetch_calls[0][0], None)
         self.assertEqual(ex.fetch_calls[0][2]["origClientOrderId"], "buy-id")
 
+    def test_balance_mismatch_blocks_market_sell(self):
+        ex = FakeExchange(free=0.0005)
+        broker = LiveBroker(ex, "USDT")
+        result = broker.sell("SOL/USDT", 0.001, 70.0, "sell-id", True)
+        self.assertTrue(result["reconciliation_required"])
+        self.assertEqual(ex.created, [])
+
 
 class StateSafetyTests(unittest.TestCase):
+    def test_corrupt_state_fails_closed_instead_of_resetting_positions(self):
+        cfg = make_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "state.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("{not valid json")
+            with self.assertRaises(ValueError):
+                load_state(path, cfg)
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "{not valid json")
+
     def test_dust_state_is_not_processed_as_a_trading_position(self):
         cfg = make_config()
         with tempfile.TemporaryDirectory() as tmp:
