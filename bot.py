@@ -319,24 +319,69 @@ class LiveBroker:
                 net -= float(fee["cost"])  # fee dibayar dalam koin dasar -> kurangi qty yang bisa dijual
         return {"qty": net, "price": price, "cost": spent}
 
-    def sell(self, sym: str, qty: float, last_price: float) -> Optional[dict]:
-        free = self.base_free(sym)
-        q = min(qty, free)
-        if q <= 0:
-            return None
-        q = float(self.ex.amount_to_precision(sym, q))
-        market = self.ex.market(sym)
-        min_amt = ((market.get("limits") or {}).get("amount") or {}).get("min") or 0
-        if q <= 0 or q < float(min_amt):
-            return None
-        order = self._settle(self.ex.create_market_sell_order(sym, q), sym)
-        filled = float(order.get("filled") or q)
-        price = float(order.get("average") or last_price)
+    def sell(
+        self,
+        sym: str,
+        qty: float,
+        last_price: float,
+        client_order_id: Optional[str] = None,
+        submit_new: bool = True,
+    ) -> Optional[dict]:
+        if not client_order_id:
+            raise RuntimeError(f"SELL {sym} ditolak: clientOrderId wajib ada")
+
+        if submit_new:
+            free = self.base_free(sym)
+            q = min(qty, free)
+            if q <= 0:
+                return None
+            q = float(self.ex.amount_to_precision(sym, q))
+            market = self.ex.market(sym)
+            min_amt = ((market.get("limits") or {}).get("amount") or {}).get("min") or 0
+            if q <= 0 or q < float(min_amt):
+                return None
+
+            # ID sudah disimpan ke state sebelum request dikirim.
+            order = self.ex.create_market_sell_order(
+                sym, q, {"clientOrderId": client_order_id}
+            )
+        else:
+            # Request sebelumnya mungkin diterima Binance meski respons timeout.
+            # Cari order lama. Jangan pernah mengirim order kedua secara otomatis.
+            order = self.ex.fetch_order(
+                None, sym, {"origClientOrderId": client_order_id}
+            )
+
+        order = self._settle(order, sym)
+
+        filled_raw = order.get("filled")
+        if filled_raw is None:
+            raise RuntimeError(
+                f"SELL {sym} tanpa data filled: id={order.get('id')} "
+                f"clientOrderId={client_order_id}"
+            )
+
+        filled = float(filled_raw)
+        status = str(order.get("status") or "").lower()
+
+        if filled <= 0 or status == "open":
+            raise RuntimeError(
+                f"SELL {sym} belum final: id={order.get('id')} "
+                f"status={status} filled={filled}; menunggu rekonsiliasi"
+            )
+
+        price = float(order.get("average") or 0)
+        if price <= 0:
+            raise RuntimeError(
+                f"SELL {sym} harga fill tidak valid: id={order.get('id')}"
+            )
+
         proceeds = float(order.get("cost") or filled * price)
         fees = order.get("fees") or ([order["fee"]] if order.get("fee") else [])
         for fee in fees:
             if fee and fee.get("currency") == self.quote and fee.get("cost"):
                 proceeds -= float(fee["cost"])
+
         return {"qty": filled, "price": price, "proceeds": proceeds}
 
     # ---- OCO: TP + SL dieksekusi di sisi Binance ------------------------------
@@ -493,6 +538,17 @@ class Bot:
 
     def _check_exit(self, sym: str, st: dict, now: float) -> None:
         pos = st["position"]
+
+        # Rekonsiliasi SELL tertunda harus didahulukan dari pemeriksaan harga.
+        # Jangan mengirim order baru hanya karena harga sudah berbalik.
+        pending = pos.get("sell_pending")
+        if pending:
+            price = self.last_price(sym)
+            self._exit(
+                sym, st, pending.get("reason", "SL"), price, now
+            )
+            return
+
         if pos.get("oco"):  # TP/SL dijaga Binance lewat OCO; bot hanya memantau statusnya
             self._check_oco(sym, st, pos, now)
             return
@@ -553,27 +609,86 @@ class Bot:
 
     def _exit(self, sym: str, st: dict, reason: str, price: float, now: float) -> None:
         pos = st["position"]
-        res = self.broker.sell(sym, pos["qty"], price)
-        if res is None:
-            st.update(status="idle", position=None, last_trade_ts=now, need_reset=True)
+        pending = pos.get("sell_pending")
+        submit_new = pending is None
+
+        if submit_new:
+            # Binance clientOrderId maksimal 36 karakter.
+            base = sym.split("/")[0].lower()
+            client_order_id = f"rsi{int(now * 1000)}{base}"
+            pos["sell_pending"] = {
+                "client_order_id": client_order_id,
+                "reason": reason,
+                "requested_qty": float(pos["qty"]),
+                "created_at": now,
+            }
             self.save()
-            self.notify(f"⚠️ {sym}: saldo koin tidak ditemukan saat {reason} (mungkin sudah dijual manual). "
-                        f"Status posisi direset ke idle.")
+        else:
+            client_order_id = pending["client_order_id"]
+            reason = pending.get("reason", reason)
+
+        if isinstance(self.broker, LiveBroker):
+            res = self.broker.sell(
+                sym, pos["qty"], price, client_order_id, submit_new
+            )
+        else:
+            res = self.broker.sell(sym, pos["qty"], price)
+
+        if res is None:
+            if not pos.get("sell_warned"):
+                pos["sell_warned"] = True
+                self.save()
+                self.notify(
+                    f"⚠️ {sym}: SELL {reason} belum dapat dilakukan. "
+                    f"Posisi dan ID order tetap disimpan untuk rekonsiliasi."
+                )
             return
+
+        pos.pop("sell_warned", None)
         self._record_exit(sym, st, reason, res, now)
 
     def _record_exit(self, sym: str, st: dict, reason: str, res: dict, now: float) -> None:
-        """Catat hasil exit (market sell oleh bot, atau leg OCO yang terisi di Binance)."""
+        """Catat fill aktual; pertahankan sisa posisi bila order hanya terisi sebagian."""
         pos = st["position"]
+        original_qty = float(pos["qty"])
+        sold = min(float(res.get("qty") or 0), original_qty)
+
+        if sold <= 0 or original_qty <= 0:
+            raise RuntimeError(
+                f"Fill exit {sym} tidak valid: sold={sold}, position={original_qty}"
+            )
+
+        pos.pop("sell_pending", None)
+        original_cost = float(pos["cost"])
+        cost_part = original_cost * (sold / original_qty)
+        pnl = float(res["proceeds"]) - cost_part
+        pnl_pct = pnl / cost_part * 100.0 if cost_part else 0.0
+        q = self.cfg.quote
+        remaining = max(0.0, original_qty - sold)
+        tolerance = max(original_qty * 1e-8, 1e-12)
+
+        # Partial fill: hanya kurangi bagian yang benar-benar terjual.
+        if remaining > tolerance:
+            pos["qty"] = remaining
+            pos["cost"] = max(0.0, original_cost - cost_part)
+            pos["oco"] = None
+            pos["oco_retry_at"] = 0
+            pos.pop("oco_warned", None)
+            st["status"] = "in_position"
+            self.save()
+            self.notify(
+                f"⚠️ PARTIAL EXIT {sym} ({reason})\n"
+                f"Terjual {sold:.8f} dari {original_qty:.8f}\n"
+                f"Sisa posisi {remaining:.8f}\n"
+                f"PnL bagian terjual {pnl:+.2f} {q} ({pnl_pct:+.2f}%)\n"
+                f"Sisa posisi tetap dipantau bot."
+            )
+            return
+
+        # Full fill: baru sekarang posisi boleh ditutup.
         st["position"] = None
         st["last_trade_ts"] = now
         st["need_reset"] = True
-
-        sold = min(res["qty"], pos["qty"])
-        cost_part = pos["cost"] * (sold / pos["qty"]) if pos["qty"] > 0 else pos["cost"]
-        pnl = res["proceeds"] - cost_part
-        pnl_pct = pnl / cost_part * 100.0 if cost_part else 0.0
-        q = self.cfg.quote
 
         if reason == "SL":
             st["status"] = "cooldown"
