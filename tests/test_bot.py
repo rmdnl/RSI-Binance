@@ -7,6 +7,10 @@ from unittest.mock import patch
 from bot import Bot, Config, LiveBroker, closed_only, load_state, rsi_series
 
 
+class OrderNotFound(Exception):
+    pass
+
+
 class FakeExchange:
     def __init__(self, free=0.00067):
         self.free = free
@@ -45,6 +49,17 @@ class FakeExchange:
         self.fetch_calls.append((order_id, symbol, params))
         return {"id": "buy-1", "status": "closed", "filled": 1.0,
                 "average": 10.0, "cost": 10.0, "fees": []}
+
+
+class TimeoutExchange(FakeExchange):
+    def create_market_buy_order_with_cost(self, symbol, cost, params):
+        raise TimeoutError("simulated response timeout")
+
+
+class MissingOrderExchange(FakeExchange):
+    def fetch_order(self, order_id, symbol, params):
+        self.fetch_calls.append((order_id, symbol, params))
+        raise OrderNotFound("not found yet")
 
 
 class DummyNotifier:
@@ -107,6 +122,39 @@ class BrokerSafetyTests(unittest.TestCase):
         result = broker.sell("SOL/USDT", 0.001, 70.0, "sell-id", True)
         self.assertTrue(result["reconciliation_required"])
         self.assertEqual(ex.created, [])
+
+
+class PendingBuyTests(unittest.TestCase):
+    def test_buy_intent_is_saved_before_exchange_request(self):
+        cfg = make_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg.state_file = os.path.join(tmp, "state.json")
+            ex = TimeoutExchange(free=10)
+            state = {"symbols": {"SOL/USDT": {"status": "idle", "position": None, "entries": []}}}
+            bot = Bot(cfg, None, LiveBroker(ex, "USDT"), DummyNotifier(), state, now_fn=lambda: 1000)
+            with self.assertRaises(TimeoutError):
+                bot._begin_buy("SOL/USDT", state["symbols"]["SOL/USDT"],
+                               10, 10, 2, 30, 30, 29, 33, 1000)
+            self.assertIn("buy_pending", state["symbols"]["SOL/USDT"])
+            self.assertTrue(os.path.exists(cfg.state_file))
+
+    def test_unknown_buy_order_is_queried_not_resubmitted(self):
+        cfg = make_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg.state_file = os.path.join(tmp, "state.json")
+            ex = MissingOrderExchange(free=10)
+            state = {"symbols": {"SOL/USDT": {
+                "status": "idle", "position": None,
+                "buy_pending": {"client_order_id": "buy-id", "cost": 10, "price": 10,
+                    "tp_pct": 2, "rsi_4h": 30, "rsi_1h": 30,
+                    "rsi_15m_prev": 29, "rsi_15m_last": 33,
+                    "created_at": 100, "attempts": 0, "next_check_at": 0}
+            }}}
+            bot = Bot(cfg, None, LiveBroker(ex, "USDT"), DummyNotifier(), state, now_fn=lambda: 100)
+            bot.process("SOL/USDT")
+            self.assertEqual(ex.created, [])
+            self.assertEqual(ex.fetch_calls[0][2]["origClientOrderId"], "buy-id")
+            self.assertIn("buy_pending", state["symbols"]["SOL/USDT"])
 
 
 class StateSafetyTests(unittest.TestCase):
