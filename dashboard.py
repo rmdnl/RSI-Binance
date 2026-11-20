@@ -77,9 +77,46 @@ def realized_fifo(client):
     total = wins = losses = closed = 0
     rows, warnings = [], []
     since = int((time.time() - 90 * 86400) * 1000)
+    fee_prices = {}
+
+    def fee_quote(amount, currency, base, quote):
+        if not amount or not currency or currency == base:
+            return 0.0
+        if currency == quote:
+            return amount
+        pair = currency + "/" + quote
+        if pair not in client.markets:
+            warnings.append("Fee asset tidak dapat dinilai: " + currency)
+            return 0.0
+        if pair not in fee_prices:
+            fee_prices[pair] = num(client.fetch_ticker(pair).get("last"))
+        return amount * fee_prices[pair]
+
     for symbol in SYMBOLS:
         try:
-            fills = sorted(client.fetch_my_trades(symbol, since=since, limit=1000),
+            fills, params, cursor_id = [], {}, None
+            for page_no in range(50):
+                page = client.fetch_my_trades(
+                    symbol, since=since if cursor_id is None else None,
+                    limit=1000, params=params,
+                )
+                if not page:
+                    break
+                fills.extend(page)
+                if len(page) < 1000:
+                    break
+                try:
+                    next_id = int(page[-1]["id"]) + 1
+                except (KeyError, TypeError, ValueError):
+                    next_id = None
+                if next_id is None or next_id <= (cursor_id or -1):
+                    warnings.append(symbol + ": pagination trade tidak dapat dilanjutkan")
+                    break
+                cursor_id = next_id
+                params = {"fromId": cursor_id}
+            else:
+                warnings.append(symbol + ": histori dibatasi 50 halaman")
+            fills = sorted({str(x.get("id")): x for x in fills}.values(),
                            key=lambda x: (x.get("timestamp") or 0, str(x.get("id") or "")))
             lots = deque()
             base, quote = symbol.split("/")
@@ -88,13 +125,14 @@ def realized_fifo(client):
                 price, cost = num(t.get("price")), num(t.get("cost"), qty * num(t.get("price")))
                 fee = t.get("fee") or {}
                 fc, currency = num(fee.get("cost")), str(fee.get("currency") or "")
+                fee_value = fee_quote(fc, currency, base, quote)
                 if side == "buy":
                     net_qty = qty - (fc if currency == base else 0)
-                    buy_cost = cost + (fc if currency == quote else 0)
+                    buy_cost = cost + fee_value
                     if net_qty > 0: lots.append([net_qty, buy_cost])
                 elif side == "sell":
                     sell_qty = max(0, qty - (fc if currency == base else 0))
-                    proceeds = cost - (fc if currency == quote else 0)
+                    proceeds = cost - fee_value
                     remain = sell_qty
                     matched_qty = matched_cost = 0.0
                     while remain > 1e-12 and lots:
@@ -120,7 +158,7 @@ def realized_fifo(client):
     return {"pnl": total, "closed_trades": closed, "wins": wins, "losses": losses,
         "win_rate": wins / closed * 100 if closed else None, "rows": rows[:30],
         "period_days": 90, "warnings": warnings,
-        "method": "FIFO seluruh fill akun pada pair terpilih selama 90 hari, termasuk transaksi manual."}
+        "method": "FIFO trade history 90 hari (termasuk transaksi manual); fee base/quote/asset ketiga dikonversi bila tersedia."}
 
 def build_snapshot():
     state = read_state()
@@ -138,15 +176,28 @@ def build_snapshot():
     positions, position_value, unrealized = [], 0.0, 0.0
     for symbol, item in states.items():
         pos = item.get("position")
-        if not pos or item.get("status") != "in_position": continue
+        position_status = str(item.get("status", "idle"))
+        if not pos or position_status not in ("in_position", "dust", "reconciliation_required"):
+            continue
         qty, entry = num(pos.get("qty")), num(pos.get("entry"))
         cost, mark = num(pos.get("cost"), qty * entry), price(symbol)
         value, pnl = qty * mark, qty * mark - cost
         position_value += value; unrealized += pnl
         opened = pos.get("opened_at")
-        positions.append({"symbol": symbol, "qty": qty, "entry": entry, "price": mark,
-            "value": value, "cost": cost, "pnl": pnl, "pnl_pct": pnl / cost * 100 if cost else 0,
-            "tp": num(pos.get("tp")), "sl": num(pos.get("sl")), "oco_active": bool(pos.get("oco")),
+        oco_active, oco_known = False, True
+        oco = pos.get("oco")
+        if oco and client:
+            try:
+                active_ids = {str(x.get("id")) for x in client.fetch_open_orders(symbol)}
+                oco_active = {str(oco.get("tp_id")), str(oco.get("sl_id"))}.issubset(active_ids)
+            except Exception as exc:
+                oco_known = False
+                warnings.append("Status OCO " + symbol + ": " + type(exc).__name__)
+        positions.append({"symbol": symbol, "status": position_status,
+            "qty": qty, "entry": entry, "price": mark, "value": value, "cost": cost,
+            "pnl": pnl, "pnl_pct": pnl / cost * 100 if cost else 0,
+            "tp": num(pos.get("tp")), "sl": num(pos.get("sl")),
+            "oco_active": oco_active, "oco_known": oco_known,
             "opened_at": datetime.fromtimestamp(opened, timezone.utc).astimezone().isoformat(timespec="seconds") if opened else ""})
 
     account = {"free_quote": 0.0, "used_quote": 0.0, "equity": 0.0, "assets": []}
@@ -205,7 +256,7 @@ HTML = r"""<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name
 <div class="card"><div class="label">Free USDT</div><div class="metric" id="free">—</div><div class="sub" id="used">Used / locked: —</div></div>
 <div class="card"><div class="label">Unrealized PnL</div><div class="metric" id="unrealized">—</div><div class="sub" id="open-count">0 positions</div></div>
 <div class="card"><div class="label">Realized PnL · 90d</div><div class="metric" id="realized">—</div><div class="sub" id="winrate">Trade history</div></div></section>
-<div class="section"><h2>Open positions</h2><span>Mark price · bot state + Binance</span></div><div class="panel wrap"><table><thead><tr><th>Pair</th><th>Qty</th><th>Entry</th><th>Mark</th><th>Value</th><th>Unrealized</th><th>TP</th><th>SL</th><th>OCO</th></tr></thead><tbody id="positions"></tbody></table></div>
+<div class="section"><h2>Open positions</h2><span>Mark price · bot state + Binance</span></div><div class="panel wrap"><table><thead><tr><th>Pair</th><th>Qty</th><th>Entry</th><th>Mark</th><th>Value</th><th>Unrealized</th><th>TP</th><th>SL</th><th>State</th><th>OCO</th></tr></thead><tbody id="positions"></tbody></table></div>
 <div class="split"><div><div class="section"><h2>Realized trade history</h2><span>FIFO · 90 days</span></div><div class="panel wrap"><table><thead><tr><th>Pair</th><th>Time</th><th>Qty matched</th><th>Exit</th><th>Realized PnL</th></tr></thead><tbody id="trades"></tbody></table></div></div>
 <div><div class="section"><h2>Account assets</h2><span>Top assets by value</span></div><div class="panel"><div id="assets" class="list"></div></div><div class="section"><h2>Pair status</h2><span>Strategy state</span></div><div class="panel"><div id="symbols" class="list"></div></div></div></div>
 <div class="section"><h2>Bot activity</h2><span>Newest first · latest 35 entries</span><span id="updated">Waiting for data</span></div><div class="panel"><div id="logs" class="logs">Waiting for bot.log…</div></div>
@@ -218,7 +269,7 @@ el('mode').textContent=d.mode;el('bot').textContent='Bot '+d.bot_status;el('dot'
 el('equity').textContent=money(a.equity);el('free').textContent=money(a.free_quote);el('used').textContent='Used / locked: '+money(a.used_quote);el('asset-note').textContent=d.data_note;
 el('unrealized').textContent=signed(d.unrealized_pnl);el('unrealized').className='metric '+tone(d.unrealized_pnl);el('open-count').textContent=d.position_count+' open positions';
 el('realized').textContent=signed(z.pnl);el('realized').className='metric '+tone(z.pnl);el('winrate').textContent=z.closed_trades+' matched exits · '+(z.win_rate==null?'Win rate n/a':fmt(z.win_rate,1)+'% win rate');
-el('positions').innerHTML=d.positions.length?d.positions.map(p=>'<tr><td class="pair">'+safe(p.symbol)+'</td><td>'+fmt(p.qty,6)+'</td><td>'+fmt(p.entry,6)+'</td><td>'+fmt(p.price,6)+'</td><td>'+money(p.value)+'</td><td class="'+tone(p.pnl)+'">'+signed(p.pnl)+'<br><span class="muted">'+fmt(p.pnl_pct)+'%</span></td><td>'+fmt(p.tp,6)+'</td><td>'+fmt(p.sl,6)+'</td><td><span class="tag">'+(p.oco_active?'ACTIVE':'NOT SET')+'</span></td></tr>').join(''):'<tr><td colspan="9" class="empty">No open positions in bot state.</td></tr>';
+el('positions').innerHTML=d.positions.length?d.positions.map(p=>'<tr><td class="pair">'+safe(p.symbol)+'</td><td>'+fmt(p.qty,6)+'</td><td>'+fmt(p.entry,6)+'</td><td>'+fmt(p.price,6)+'</td><td>'+money(p.value)+'</td><td class="'+tone(p.pnl)+'">'+signed(p.pnl)+'<br><span class="muted">'+fmt(p.pnl_pct)+'%</span></td><td>'+fmt(p.tp,6)+'</td><td>'+fmt(p.sl,6)+'</td><td><span class="tag">'+safe(p.status.toUpperCase())+'</span></td><td><span class="tag">'+(p.oco_active?'ACTIVE':(p.oco_known?'NOT ACTIVE':'UNKNOWN'))+'</span></td></tr>').join(''):'<tr><td colspan="10" class="empty">No open positions in bot state.</td></tr>';
 el('trades').innerHTML=z.rows.length?z.rows.map(t=>'<tr><td class="pair">'+safe(t.symbol)+'</td><td>'+safe(t.time?new Date(t.time).toLocaleString():'—')+'</td><td>'+fmt(t.qty,6)+'</td><td>'+fmt(t.price,6)+'</td><td class="'+tone(t.pnl)+'">'+signed(t.pnl)+'</td></tr>').join(''):'<tr><td colspan="5" class="empty">No matched realized trades found.</td></tr>';
 el('assets').innerHTML=(a.assets||[]).map(x=>'<div class="item"><span><b>'+safe(x.asset)+'</b><br><small class="muted">'+fmt(x.total,6)+' total · '+fmt(x.free,6)+' free</small></span><b>'+money(x.value)+'</b></div>').join('')||'<div class="empty">Asset breakdown unavailable.</div>';
 el('symbols').innerHTML=d.symbols.map(x=>'<div class="item"><b>'+safe(x.symbol)+'</b><span class="tag">'+safe(x.status.toUpperCase())+'</span></div>').join('')||'<div class="empty">No configured pairs</div>';
