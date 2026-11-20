@@ -89,7 +89,11 @@ def realized_fifo(client):
             warnings.append("Fee asset tidak dapat dinilai: " + currency)
             return 0.0
         if pair not in fee_prices:
-            fee_prices[pair] = num(client.fetch_ticker(pair).get("last"))
+            try:
+                fee_prices[pair] = num(client.fetch_ticker(pair).get("last"))
+            except Exception as exc:
+                warnings.append("Konversi fee " + currency + " gagal: " + type(exc).__name__)
+                fee_prices[pair] = 0.0
         return amount * fee_prices[pair]
 
     for symbol in SYMBOLS:
