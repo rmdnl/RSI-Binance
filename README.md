@@ -30,7 +30,7 @@ Bot trading spot Binance untuk banyak pair sekaligus. Daftar pair diatur manual 
 ```bash
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env      # lalu isi
+cp env.example .env      # lalu isi
 python bot.py
 ```
 
@@ -68,6 +68,9 @@ source venv/bin/activate && python bot.py
 Atau pakai systemd agar otomatis menyala setelah reboot. State tersimpan di `state.json`, jadi posisi tetap terpantau setelah bot restart.
 
 ## Catatan penting
+
+- Jika hasil order tidak diketahui akibat timeout, bot menyimpan intent BUY/SELL dan merekonsiliasi menggunakan `clientOrderId`. Bot tidak mengirim order duplikat otomatis ketika status order belum pasti.
+- Posisi di bawah filter minimum Binance ditandai `dust` dan tidak dicoba order berulang. Posisi dengan saldo/order yang tidak cocok ditandai `reconciliation_required`; bot mempertahankan state dan memblokir entry pair tersebut sampai diperiksa.
 
 - Selama OCO aktif, koin yang dibeli bot **terkunci** di order tersebut. Bila ingin menjual manual, batalkan OCO-nya dulu di Binance (bot akan mendeteksi dan menyesuaikan). Order OCO hanya melindungi posisi yang dibuat bot.
 - SL berjenis market: terisi hampir pasti, tetapi harga eksekusi bisa lebih rendah dari harga stop saat pasar jatuh cepat (slippage).
