@@ -122,7 +122,14 @@ def realized_fifo(client):
                 params = {"fromId": cursor_id}
             else:
                 warnings.append(symbol + ": histori dibatasi 50 halaman")
-            fills = sorted({str(x.get("id")): x for x in fills}.values(),
+            unique_fills = {}
+            for index, trade in enumerate(fills):
+                trade_id = trade.get("id")
+                key = str(trade_id) if trade_id is not None else (
+                    "no-id:" + str(trade.get("timestamp")) + ":" + str(index)
+                )
+                unique_fills[key] = trade
+            fills = sorted(unique_fills.values(),
                            key=lambda x: (x.get("timestamp") or 0, str(x.get("id") or "")))
             lots = deque()
             base, quote = symbol.split("/")
@@ -207,6 +214,8 @@ def build_snapshot():
             except Exception as exc:
                 oco_known = False
                 warnings.append("Status OCO " + symbol + ": " + type(exc).__name__)
+        elif oco:
+            oco_known = False
         positions.append({"symbol": symbol, "status": position_status,
             "qty": qty, "entry": entry, "price": mark, "value": value, "cost": cost,
             "pnl": pnl, "pnl_pct": pnl / cost * 100 if cost else 0,
