@@ -62,6 +62,16 @@ class MissingOrderExchange(FakeExchange):
         raise OrderNotFound("not found yet")
 
 
+class CanceledExchange(FakeExchange):
+    def create_market_buy_order_with_cost(self, symbol, cost, params):
+        return {"id": "buy-canceled", "status": "canceled", "filled": 0,
+                "average": 0, "cost": 0, "fees": []}
+
+    def create_market_sell_order(self, *args):
+        return {"id": "sell-canceled", "status": "canceled", "filled": 0,
+                "average": 0, "cost": 0, "fees": []}
+
+
 class DummyNotifier:
     def send(self, message):
         pass
@@ -122,6 +132,14 @@ class BrokerSafetyTests(unittest.TestCase):
         result = broker.sell("SOL/USDT", 0.001, 70.0, "sell-id", True)
         self.assertTrue(result["reconciliation_required"])
         self.assertEqual(ex.created, [])
+
+    def test_terminal_no_fill_buy_and_sell_are_reported(self):
+        ex = CanceledExchange(free=10)
+        broker = LiveBroker(ex, "USDT")
+        buy = broker.buy("SOL/USDT", 10, 10, "buy-id", True)
+        sell = broker.sell("SOL/USDT", 1, 10, "sell-id", True)
+        self.assertTrue(buy["terminal_no_fill"])
+        self.assertTrue(sell["terminal_no_fill"])
 
 
 class PendingBuyTests(unittest.TestCase):
