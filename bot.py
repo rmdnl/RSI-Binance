@@ -636,6 +636,8 @@ class Bot:
         # Jangan mengirim order baru hanya karena harga sudah berbalik.
         pending = pos.get("sell_pending")
         if pending:
+            if now < float(pending.get("next_check_at", 0)):
+                return
             price = self.last_price(sym)
             self._exit(
                 sym, st, pending.get("reason", "SL"), price, now
@@ -756,18 +758,42 @@ class Bot:
                 "reason": reason,
                 "requested_qty": float(pos["qty"]),
                 "created_at": now,
+                "next_check_at": now + 5,
+                "not_found_attempts": 0,
             }
             self.save()
         else:
             client_order_id = pending["client_order_id"]
             reason = pending.get("reason", reason)
 
-        if isinstance(self.broker, LiveBroker):
-            res = self.broker.sell(
-                sym, pos["qty"], price, client_order_id, submit_new
-            )
-        else:
-            res = self.broker.sell(sym, pos["qty"], price)
+        try:
+            if isinstance(self.broker, LiveBroker):
+                res = self.broker.sell(
+                    sym, pos["qty"], price, client_order_id, submit_new
+                )
+            else:
+                res = self.broker.sell(sym, pos["qty"], price)
+        except Exception as exc:
+            is_order_missing = type(exc).__name__ == "OrderNotFound"
+            is_network_error = bool(NETWORK_ERRORS and isinstance(exc, NETWORK_ERRORS))
+            if not submit_new and (is_order_missing or is_network_error):
+                pending = pos.get("sell_pending") or {}
+                if is_order_missing:
+                    pending["not_found_attempts"] = int(pending.get("not_found_attempts", 0)) + 1
+                pending["next_check_at"] = now + 30
+                pos["sell_pending"] = pending
+                self.save()
+                if is_order_missing and pending["not_found_attempts"] >= 20:
+                    self._mark_reconciliation(
+                        sym, st, "clientOrderId SELL tidak ditemukan setelah 10 menit; periksa Binance manual"
+                    )
+                else:
+                    log.warning(
+                        "%s: rekonsiliasi SELL tertunda (%s); cek ulang 30 detik",
+                        sym, type(exc).__name__,
+                    )
+                return
+            raise
 
         if isinstance(res, dict) and res.get("terminal_no_fill"):
             pos.pop("sell_pending", None)
@@ -908,11 +934,14 @@ class Bot:
                 pending["client_order_id"], False,
             )
         except Exception as exc:
-            if type(exc).__name__ == "OrderNotFound":
-                pending["attempts"] = int(pending.get("attempts", 0)) + 1
+            is_order_missing = type(exc).__name__ == "OrderNotFound"
+            is_network_error = bool(NETWORK_ERRORS and isinstance(exc, NETWORK_ERRORS))
+            if is_order_missing or is_network_error:
+                if is_order_missing:
+                    pending["attempts"] = int(pending.get("attempts", 0)) + 1
                 pending["next_check_at"] = now + 30
                 self.save()
-                if pending["attempts"] in (1, 5, 20):
+                if is_order_missing and pending["attempts"] in (1, 5, 20):
                     self.notify(
                         f"🚨 BUY {sym} belum ditemukan saat rekonsiliasi. "
                         f"Tidak mengirim BUY ulang otomatis; posisi entry diblokir demi keamanan."
