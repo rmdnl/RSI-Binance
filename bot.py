@@ -345,6 +345,8 @@ class LiveBroker:
         order = self._settle(order, sym)
         filled = float(order.get("filled") or 0)
         status = str(order.get("status") or "").lower()
+        if filled <= 0 and status in ("canceled", "expired", "rejected"):
+            return {"terminal_no_fill": True, "status": status}
         if filled <= 0 or status == "open":
             raise RuntimeError(
                 f"BUY {sym} belum final: id={order.get('id')} status={status} filled={filled}"
@@ -439,6 +441,8 @@ class LiveBroker:
         filled = float(filled_raw)
         status = str(order.get("status") or "").lower()
 
+        if filled <= 0 and status in ("canceled", "expired", "rejected"):
+            return {"terminal_no_fill": True, "status": status}
         if filled <= 0 or status == "open":
             raise RuntimeError(
                 f"SELL {sym} belum final: id={order.get('id')} "
@@ -638,6 +642,8 @@ class Bot:
             )
             return
 
+        if now < float(pos.get("sell_retry_at", 0)):
+            return
         if pos.get("oco"):  # TP/SL dijaga Binance lewat OCO; bot hanya memantau statusnya
             self._check_oco(sym, st, pos, now)
             return
@@ -763,6 +769,15 @@ class Bot:
         else:
             res = self.broker.sell(sym, pos["qty"], price)
 
+        if isinstance(res, dict) and res.get("terminal_no_fill"):
+            pos.pop("sell_pending", None)
+            pos["sell_retry_at"] = now + 30
+            self.save()
+            self.notify(
+                f"⚠️ SELL {sym} berakhir {res.get('status')} tanpa fill. "
+                f"Posisi tetap disimpan; percobaan ulang paling cepat 30 detik."
+            )
+            return
         if isinstance(res, dict) and res.get("dust"):
             self._mark_dust(sym, st, pos, res.get("reason", "below_minimum"))
             return
@@ -904,6 +919,11 @@ class Bot:
                     )
                 return
             raise
+        if res.get("terminal_no_fill"):
+            st.pop("buy_pending", None)
+            self.save()
+            self.notify(f"⚠️ BUY {sym} berakhir {res['status']} tanpa fill; intent dibersihkan.")
+            return
         self._finalize_buy(
             sym, st, res, float(pending["created_at"]), float(pending["tp_pct"]),
             float(pending["rsi_4h"]), float(pending["rsi_1h"]),
@@ -925,6 +945,11 @@ class Bot:
             res = self.broker.buy(sym, cost, price, client_order_id, True)
         else:
             res = self.broker.buy(sym, cost, price)
+        if isinstance(res, dict) and res.get("terminal_no_fill"):
+            st.pop("buy_pending", None)
+            self.save()
+            self.notify(f"⚠️ BUY {sym} berakhir {res['status']} tanpa fill; intent dibersihkan.")
+            return
         self._finalize_buy(sym, st, res, now, tp_pct, r4, r1, prev, last)
 
     def _scan_entry(self, sym: str, st: dict, now: float) -> None:
