@@ -384,15 +384,14 @@ class LiveBroker:
         market_min = float(market_lot.get("minQty") or 0)
         lot_min = float(((market.get("limits") or {}).get("amount") or {}).get("min") or 0)
         min_amount = max(market_min, lot_min)
-        min_cost = float(((market.get("limits") or {}).get("cost") or {}).get("min") or 0)
+        fallback_min_cost = float(((market.get("limits") or {}).get("cost") or {}).get("min") or 0)
+        min_cost = fallback_min_cost
         if "NOTIONAL" in filters:
             nf = filters["NOTIONAL"]
-            if nf.get("applyMinToMarket", True):
-                min_cost = max(min_cost, float(nf.get("minNotional") or 0))
+            min_cost = float(nf.get("minNotional") or 0) if nf.get("applyMinToMarket", True) else 0.0
         elif "MIN_NOTIONAL" in filters:
             nf = filters["MIN_NOTIONAL"]
-            if nf.get("applyToMarket", True):
-                min_cost = max(min_cost, float(nf.get("minNotional") or 0))
+            min_cost = float(nf.get("minNotional") or 0) if nf.get("applyToMarket", True) else 0.0
         if rounded <= 0 or rounded < min_amount:
             return 0.0, "below_min_amount"
         if min_cost and rounded * float(price) < min_cost:
@@ -1124,16 +1123,25 @@ def load_state(path: str, cfg: Config) -> dict:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 state = json.load(f)
-        except Exception:
-            log.exception("state.json rusak, membuat state baru (backup: %s.bak)", path)
-            os.replace(path, path + ".bak")
-            state = {}
+        except Exception as exc:
+            log.exception("State file tidak dapat dibaca; startup dibatalkan demi keamanan posisi")
+            raise ValueError(
+                f"State file '{path}' rusak/tidak terbaca. Bot tidak akan membuat state kosong; "
+                "pulihkan backup atau perbaiki file sebelum start."
+            ) from exc
+        if not isinstance(state, dict):
+            raise ValueError(f"State file '{path}' harus berupa JSON object; startup dibatalkan")
+    symbols_state = state.setdefault("symbols", {})
+    if not isinstance(symbols_state, dict):
+        raise ValueError(f"State file '{path}' memiliki field symbols yang tidak valid")
     state.setdefault("paper_quote", cfg.dry_run_balance)
-    state.setdefault("symbols", {})
     for sym in cfg.symbols:
+        stored = symbols_state.get(sym, {})
+        if not isinstance(stored, dict):
+            raise ValueError(f"State pair {sym} tidak valid; startup dibatalkan")
         base = new_symbol_state()
-        base.update(state["symbols"].get(sym, {}))
-        state["symbols"][sym] = base
+        base.update(stored)
+        symbols_state[sym] = base
     return state
 
 
