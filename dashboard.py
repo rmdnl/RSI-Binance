@@ -29,7 +29,7 @@ ex = None
 ex_error = None
 
 def num(v, default=0.0):
-    try: return float(v or 0)
+    try: return float(v) if v is not None and v != "" else default
     except (TypeError, ValueError): return default
 
 def read_state():
@@ -42,12 +42,11 @@ def read_state():
 
 def exchange():
     global ex, ex_error
-    if DRY_RUN: return None
     if ex is not None: return ex
     try:
         import ccxt
-        ex = ccxt.binance({"apiKey": str(ENV.get("BINANCE_API_KEY") or ""),
-            "secret": str(ENV.get("BINANCE_API_SECRET") or ""), "enableRateLimit": True,
+        ex = ccxt.binance({"apiKey": "" if DRY_RUN else str(ENV.get("BINANCE_API_KEY") or ""),
+            "secret": "" if DRY_RUN else str(ENV.get("BINANCE_API_SECRET") or ""), "enableRateLimit": True,
             "timeout": 12000, "options": {"defaultType": "spot", "adjustForTimeDifference": True}})
         if TESTNET: ex.set_sandbox_mode(True)
         ex.load_markets()
