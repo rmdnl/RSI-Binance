@@ -369,7 +369,7 @@ class LiveBroker:
                           belowPrice=pp(sl_stop * 0.997), belowTimeInForce="GTC")
         else:
             params.update(belowType="STOP_LOSS", belowStopPrice=pp(sl_stop))
-        res = self.ex.request("orderList/oco", "private", "POST", params)
+        res = self.ex.request("orderList/oco", ["private"], "POST", params)
         tp_id = sl_id = None
         for r in res.get("orderReports") or []:
             if str(r.get("type", "")).upper().startswith("STOP_LOSS"):

@@ -68,7 +68,8 @@ def bot_status():
 def read_logs():
     try:
         with LOG_FILE.open(encoding="utf-8", errors="replace") as f:
-            return list(deque((x.rstrip() for x in f), maxlen=35))
+            logs = list(deque((x.rstrip() for x in f), maxlen=35))
+            return list(reversed(logs))
     except FileNotFoundError: return []
     except Exception as e: return ["Log unavailable: " + type(e).__name__]
 
@@ -207,7 +208,7 @@ HTML = r"""<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name
 <div class="section"><h2>Open positions</h2><span>Mark price · bot state + Binance</span></div><div class="panel wrap"><table><thead><tr><th>Pair</th><th>Qty</th><th>Entry</th><th>Mark</th><th>Value</th><th>Unrealized</th><th>TP</th><th>SL</th><th>OCO</th></tr></thead><tbody id="positions"></tbody></table></div>
 <div class="split"><div><div class="section"><h2>Realized trade history</h2><span>FIFO · 90 days</span></div><div class="panel wrap"><table><thead><tr><th>Pair</th><th>Time</th><th>Qty matched</th><th>Exit</th><th>Realized PnL</th></tr></thead><tbody id="trades"></tbody></table></div></div>
 <div><div class="section"><h2>Account assets</h2><span>Top assets by value</span></div><div class="panel"><div id="assets" class="list"></div></div><div class="section"><h2>Pair status</h2><span>Strategy state</span></div><div class="panel"><div id="symbols" class="list"></div></div></div></div>
-<div class="section"><h2>Bot activity</h2><span id="updated">Waiting for data</span></div><div class="panel"><div id="logs" class="logs">Waiting for bot.log…</div></div>
+<div class="section"><h2>Bot activity</h2><span>Newest first · latest 35 entries</span><span id="updated">Waiting for data</span></div><div class="panel"><div id="logs" class="logs">Waiting for bot.log…</div></div>
 <div class="foot" id="note">Read-only dashboard. Tidak menyediakan fungsi membuat, mengubah, atau membatalkan order.</div></main>
 <script>
 const el=id=>document.getElementById(id),fmt=(v,d=2)=>Number(v||0).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d}),money=v=>fmt(v)+' USDT',signed=v=>(v>=0?'+':'')+money(v),tone=v=>v>=0?'g':'r';
