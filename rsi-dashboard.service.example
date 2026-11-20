@@ -1,0 +1,25 @@
+[Unit]
+Description=RSI Binance Read-Only Dashboard
+After=network-online.target rsi-binance.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/rsi-binance
+Environment=PYTHONUNBUFFERED=1
+Environment=DASHBOARD_HOST=0.0.0.0
+Environment=DASHBOARD_PORT=8060
+ExecStart=/opt/rsi-binance/venv/bin/python -u /opt/rsi-binance/dashboard.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/rsi-binance
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
