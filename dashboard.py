@@ -25,6 +25,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("rsi-dashboard")
 lock = Lock()
 cache = {"at": 0.0, "data": None}
+realized_cache = {"at": 0.0, "data": None}
+REALIZED_CACHE_TTL = max(60, int(os.getenv("DASHBOARD_REALIZED_CACHE_SECONDS", "300")))
 ex = None
 ex_error = None
 
@@ -164,6 +166,14 @@ def realized_fifo(client):
         "period_days": 90, "warnings": warnings,
         "method": "FIFO trade history 90 hari (termasuk transaksi manual); fee base/quote/asset ketiga dikonversi bila tersedia."}
 
+def cached_realized(client):
+    now = time.time()
+    if realized_cache["data"] is None or now - realized_cache["at"] >= REALIZED_CACHE_TTL:
+        realized_cache["data"] = realized_fifo(client)
+        realized_cache["at"] = now
+    return realized_cache["data"]
+
+
 def build_snapshot():
     state = read_state()
     states = state.get("symbols") or {}
@@ -229,7 +239,7 @@ def build_snapshot():
             assets.sort(key=lambda x: x["value"], reverse=True)
             account.update(free_quote=num(free_map.get(QUOTE)), used_quote=num(used_map.get(QUOTE)),
                 equity=equity, assets=assets[:20])
-            realized = realized_fifo(client)
+            realized = cached_realized(client)
         except Exception as e: warnings.append("Saldo akun: " + type(e).__name__ + ": " + str(e)[:100])
     elif ex_error: warnings.append("Binance API: " + ex_error)
 
@@ -268,7 +278,8 @@ HTML = r"""<!doctype html><html lang="id"><head><meta charset="utf-8"><meta name
 <script>
 const el=id=>document.getElementById(id),fmt=(v,d=2)=>Number(v||0).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d}),money=v=>fmt(v)+' USDT',signed=v=>(v>=0?'+':'')+money(v),tone=v=>v>=0?'g':'r';
 function safe(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-async function loadData(){try{const res=await fetch('/api/overview',{cache:'no-store'});if(!res.ok)throw Error('HTTP '+res.status);const d=await res.json(),a=d.account,z=d.realized;
+let loading=false;
+async function loadData(){if(loading)return;loading=true;try{const res=await fetch('/api/overview',{cache:'no-store'});if(!res.ok)throw Error('HTTP '+res.status);const d=await res.json(),a=d.account,z=d.realized;
 el('mode').textContent=d.mode;el('bot').textContent='Bot '+d.bot_status;el('dot').className='dot'+(d.bot_status==='active'?'':' bad');
 el('equity').textContent=money(a.equity);el('free').textContent=money(a.free_quote);el('used').textContent='Used / locked: '+money(a.used_quote);el('asset-note').textContent=d.data_note;
 el('unrealized').textContent=signed(d.unrealized_pnl);el('unrealized').className='metric '+tone(d.unrealized_pnl);el('open-count').textContent=d.position_count+' open positions';
@@ -279,7 +290,7 @@ el('assets').innerHTML=(a.assets||[]).map(x=>'<div class="item"><span><b>'+safe(
 el('symbols').innerHTML=d.symbols.map(x=>'<div class="item"><b>'+safe(x.symbol)+'</b><span class="tag">'+safe(x.status.toUpperCase())+'</span></div>').join('')||'<div class="empty">No configured pairs</div>';
 el('logs').innerHTML=d.logs.map(x=>'<div class="log">'+safe(x)+'</div>').join('')||'No logs yet';el('updated').textContent='Updated '+new Date(d.updated_at).toLocaleString();
 el('warnings').innerHTML=[...d.warnings,...z.warnings].map(x=>'<div class="warn">⚠ '+safe(x)+'</div>').join('');el('note').textContent=d.data_note+' · '+z.method+' · Auto-refresh 10s.';
-}catch(e){el('warnings').innerHTML='<div class="warn">Dashboard API error: '+safe(e.message)+'</div>'}}
+}catch(e){el('warnings').innerHTML='<div class="warn">Dashboard API error: '+safe(e.message)+'</div>'}finally{loading=false}}
 loadData();setInterval(loadData,10000);
 </script></body></html>"""
 
