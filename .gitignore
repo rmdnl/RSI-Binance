@@ -4,3 +4,10 @@ __pycache__/
 *.py[cod]
 state.json
 *.log
+
+# Runtime state, credentials, temporary and local backup files
+.env.*
+*.tmp
+*.bak
+*.backup-*
+state.json.*
