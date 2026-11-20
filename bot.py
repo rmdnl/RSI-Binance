@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -152,18 +153,41 @@ class Config:
             errs.append("SYMBOLS kosong. Isi minimal satu pair, mis. SYMBOLS=BNB/USDT,ETH/USDT")
         if not self.dry_run and not (self.api_key and self.api_secret):
             errs.append("DRY_RUN=false butuh BINANCE_API_KEY dan BINANCE_API_SECRET")
+        numeric_values = {
+            "RSI_OVERSOLD": self.rsi_oversold, "RSI_TRIGGER": self.rsi_trigger,
+            "RSI_4H_MAX": self.rsi_4h_max, "RSI_1H_MAX": self.rsi_1h_max,
+            "REARM_LEVEL": self.rearm_level, "POSITION_PCT": self.position_pct,
+            "TP_MIN_PCT": self.tp_min, "TP_MAX_PCT": self.tp_max,
+            "TP_ATR_MULT": self.tp_atr_mult, "SL_PCT": self.sl_pct,
+            "COOLDOWN_MINUTES": self.cooldown_min, "REENTRY_LOCKOUT_MINUTES": self.lockout_min,
+            "ENTRY_WINDOW_HOURS": self.entry_window_hours, "LOOP_SECONDS": self.loop_seconds,
+            "PAPER_FEE_PCT": self.paper_fee_pct,
+        }
+        for name, value in numeric_values.items():
+            if not math.isfinite(float(value)):
+                errs.append(f"{name} harus berupa angka finite")
+        if self.rsi_period < 2:
+            errs.append("RSI_PERIOD minimal 2")
+        if not (0 <= self.rsi_oversold < self.rsi_trigger <= 100):
+            errs.append("RSI_OVERSOLD dan RSI_TRIGGER harus 0..100 serta trigger > oversold")
+        if not (0 < self.rsi_4h_max <= 100 and 0 < self.rsi_1h_max <= 100):
+            errs.append("RSI_4H_MAX dan RSI_1H_MAX harus > 0 dan <= 100")
+        if not (0 <= self.rearm_level <= 100):
+            errs.append("REARM_LEVEL harus 0..100")
         if not (0 < self.position_pct <= 100):
             errs.append("POSITION_PCT harus di antara 0 dan 100")
-        if self.tp_min <= 0 or self.tp_max < self.tp_min:
-            errs.append("TP_MIN_PCT harus > 0 dan TP_MAX_PCT >= TP_MIN_PCT")
+        if self.tp_min <= 0 or self.tp_max < self.tp_min or self.tp_atr_mult <= 0:
+            errs.append("TP_MIN_PCT/TP_ATR_MULT harus > 0 dan TP_MAX_PCT >= TP_MIN_PCT")
         if self.sl_pct <= 0:
             errs.append("SL_PCT harus > 0")
-        if self.rsi_trigger <= self.rsi_oversold:
-            errs.append("RSI_TRIGGER harus lebih besar dari RSI_OVERSOLD")
-        if self.max_open < 1:
-            errs.append("MAX_OPEN_POSITIONS minimal 1")
+        if self.max_open < 1 or self.max_entries_window < 1:
+            errs.append("MAX_OPEN_POSITIONS dan MAX_ENTRIES_PER_WINDOW minimal 1")
         if self.arm_lookback < 1:
             errs.append("ARM_LOOKBACK minimal 1")
+        if self.cooldown_min < 0 or self.lockout_min < 0 or self.entry_window_hours <= 0:
+            errs.append("Cooldown/lockout tidak boleh negatif dan ENTRY_WINDOW_HOURS harus > 0")
+        if self.paper_fee_pct < 0:
+            errs.append("PAPER_FEE_PCT tidak boleh negatif")
         if self.loop_seconds < 1:
             errs.append("LOOP_SECONDS minimal 1")
         if errs:
@@ -303,21 +327,68 @@ class LiveBroker:
             order = self.ex.fetch_order(order["id"], sym)
         return order
 
-    def buy(self, sym: str, cost: float, last_price: float) -> dict:
+    def buy(
+        self, sym: str, cost: float, last_price: float,
+        client_order_id: Optional[str] = None, submit_new: bool = True,
+    ) -> dict:
         cost = float(self.ex.cost_to_precision(sym, cost))
-        order = self._settle(self.ex.create_market_buy_order_with_cost(sym, cost), sym)
+        if not client_order_id:
+            raise RuntimeError(f"BUY {sym} ditolak: clientOrderId wajib ada")
+        if submit_new:
+            order = self.ex.create_market_buy_order_with_cost(
+                sym, cost, {"clientOrderId": client_order_id}
+            )
+        else:
+            order = self.ex.fetch_order(
+                None, sym, {"origClientOrderId": client_order_id}
+            )
+        order = self._settle(order, sym)
         filled = float(order.get("filled") or 0)
-        if filled <= 0:
-            raise RuntimeError(f"Order beli {sym} tidak terisi: id={order.get('id')} status={order.get('status')}")
+        status = str(order.get("status") or "").lower()
+        if filled <= 0 or status == "open":
+            raise RuntimeError(
+                f"BUY {sym} belum final: id={order.get('id')} status={status} filled={filled}"
+            )
         price = float(order.get("average") or last_price)
+        if price <= 0:
+            raise RuntimeError(f"BUY {sym} harga fill tidak valid")
         spent = float(order.get("cost") or filled * price)
         base = sym.split("/")[0]
         net = filled
         fees = order.get("fees") or ([order["fee"]] if order.get("fee") else [])
         for fee in fees:
-            if fee and fee.get("currency") == base and fee.get("cost"):
-                net -= float(fee["cost"])  # fee dibayar dalam koin dasar -> kurangi qty yang bisa dijual
+            if not fee or not fee.get("cost"):
+                continue
+            fee_cost = float(fee["cost"])
+            if fee.get("currency") == base:
+                net -= fee_cost
+            elif fee.get("currency") == self.quote:
+                spent += fee_cost
+        if net <= 0:
+            raise RuntimeError(f"BUY {sym} net quantity tidak valid setelah fee")
         return {"qty": net, "price": price, "cost": spent}
+
+    def sellable_amount(self, sym: str, qty: float, price: float) -> tuple:
+        """Return (rounded_qty, reason) after Binance amount/notional filters."""
+        free = self.base_free(sym)
+        available = min(float(qty), free)
+        if available <= 0:
+            return 0.0, "no_free_balance"
+        rounded = float(self.ex.amount_to_precision(sym, available))
+        market = self.ex.market(sym)
+        info = market.get("info") or {}
+        filters = {x.get("filterType"): x for x in (info.get("filters") or [])}
+        market_lot = filters.get("MARKET_LOT_SIZE") or {}
+        min_amount = float(market_lot.get("minQty") or
+                           ((market.get("limits") or {}).get("amount") or {}).get("min") or 0)
+        min_cost = float(((market.get("limits") or {}).get("cost") or {}).get("min") or 0)
+        notional = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL") or {}
+        min_cost = max(min_cost, float(notional.get("minNotional") or 0))
+        if rounded <= 0 or rounded < min_amount:
+            return 0.0, "below_min_amount"
+        if min_cost and rounded * float(price) < min_cost:
+            return 0.0, "below_min_notional"
+        return rounded, None
 
     def sell(
         self,
@@ -331,15 +402,11 @@ class LiveBroker:
             raise RuntimeError(f"SELL {sym} ditolak: clientOrderId wajib ada")
 
         if submit_new:
-            free = self.base_free(sym)
-            q = min(qty, free)
-            if q <= 0:
-                return None
-            q = float(self.ex.amount_to_precision(sym, q))
-            market = self.ex.market(sym)
-            min_amt = ((market.get("limits") or {}).get("amount") or {}).get("min") or 0
-            if q <= 0 or q < float(min_amt):
-                return None
+            q, reason = self.sellable_amount(sym, qty, last_price)
+            if reason == "no_free_balance":
+                return {"reconciliation_required": True, "reason": reason}
+            if reason:
+                return {"dust": True, "reason": reason}
 
             # ID sudah disimpan ke state sebelum request dikirim.
             order = self.ex.create_market_sell_order(
@@ -398,9 +465,10 @@ class LiveBroker:
             raise RuntimeError(f"{sym} tidak mendukung OCO (ocoAllowed/LIMIT_MAKER)")
         info = self.ex.market(sym).get("info") or {}
         types = info.get("orderTypes") or []
-        q = self.ex.amount_to_precision(sym, min(qty, self.base_free(sym)))
-        if float(q) <= 0:
-            raise RuntimeError(f"Qty OCO {sym} nol setelah pembulatan")
+        q, reason = self.sellable_amount(sym, qty, tp_price)
+        if reason:
+            raise RuntimeError(f"Qty OCO {sym} tidak dapat diperdagangkan: {reason}")
+        q = self.ex.amount_to_precision(sym, q)
         pp = lambda x: self.ex.price_to_precision(sym, x)  # noqa: E731
         params = {
             "symbol": self.ex.market_id(sym),
@@ -455,10 +523,17 @@ class LiveBroker:
         if ids & {str(o["id"]) for o in self.ex.fetch_open_orders(sym)}:
             return "active", None
         for leg, oid in (("SL", oco["sl_id"]), ("TP", oco["tp_id"])):
-            o = self.ex.fetch_order(str(oid), sym)
+            try:
+                o = self.ex.fetch_order(str(oid), sym)
+            except Exception as exc:
+                if type(exc).__name__ == "OrderNotFound":
+                    continue
+                raise
             filled = float(o.get("filled") or 0)
             if filled > 0:
                 price = float(o.get("average") or o.get("price") or 0)
+                if price <= 0:
+                    raise RuntimeError(f"Fill OCO {sym} tanpa harga valid")
                 proceeds = float(o.get("cost") or filled * price)
                 fees = o.get("fees") or ([o["fee"]] if o.get("fee") else [])
                 for fee in fees:
@@ -522,6 +597,12 @@ class Bot:
         st = self.state["symbols"][sym]
         now = self.now()
 
+        if st.get("buy_pending"):
+            self._reconcile_buy(sym, st, now)
+            return
+        if st.get("status") in ("dust", "reconciliation_required"):
+            return
+
         if st["status"] == "cooldown":
             if now < st["cooldown_until"]:
                 return
@@ -562,13 +643,44 @@ class Bot:
         if now >= pos.get("oco_retry_at", 0):
             self._arm_oco(sym, st, pos, now)
 
+    def _mark_dust(self, sym: str, st: dict, pos: dict, reason: str) -> None:
+        pos.pop("sell_pending", None)
+        pos["dust"] = True
+        pos["dust_reason"] = reason
+        st["status"] = "dust"
+        self.save()
+        self.notify(
+            f"⚠️ {sym}: posisi di bawah filter order Binance ({reason}). "
+            f"Dicatat sebagai DUST dan tidak akan dicoba SELL/OCO berulang."
+        )
+
+    def _mark_reconciliation(self, sym: str, st: dict, reason: str) -> None:
+        st["status"] = "reconciliation_required"
+        st["reconciliation_reason"] = reason
+        self.save()
+        self.notify(
+            f"🚨 {sym}: rekonsiliasi manual diperlukan ({reason}). "
+            f"Posisi dipertahankan di state dan entry baru diblokir."
+        )
+
     def _arm_oco(self, sym: str, st: dict, pos: dict, now: float) -> bool:
         """Pasang (atau adopsi yang sudah ada) order OCO TP+SL di Binance. Hanya mode live."""
         cfg = self.cfg
         if cfg.dry_run or not cfg.use_oco or not hasattr(self.broker, "place_oco"):
             return False
         try:
-            oco = self.broker.find_oco(sym) or self.broker.place_oco(sym, pos["qty"], pos["tp"], pos["sl"])
+            existing = self.broker.find_oco(sym)
+            if existing:
+                oco = existing
+            else:
+                qty, reason = self.broker.sellable_amount(sym, pos["qty"], pos["tp"])
+                if reason in ("below_min_amount", "below_min_notional"):
+                    self._mark_dust(sym, st, pos, reason)
+                    return False
+                if reason:
+                    self._mark_reconciliation(sym, st, reason)
+                    return False
+                oco = self.broker.place_oco(sym, qty, pos["tp"], pos["sl"])
         except Exception as e:
             pos["oco"] = None
             pos["oco_retry_at"] = now + 300
@@ -597,9 +709,9 @@ class Bot:
             return
         # OCO sudah tidak ada tanpa ada yang terisi (dibatalkan manual / kedaluwarsa)
         if self.broker.base_free(sym) < pos["qty"] * 0.5:
-            st.update(status="idle", position=None, last_trade_ts=now, need_reset=True)
-            self.save()
-            self.notify(f"⚠️ {sym}: OCO hilang dan saldo koin tidak ada (dijual manual?). Posisi direset ke idle.")
+            self._mark_reconciliation(
+                sym, st, "OCO hilang dan saldo bebas jauh di bawah kuantitas posisi"
+            )
             return
         pos["oco"] = None
         pos["oco_retry_at"] = 0
@@ -612,10 +724,19 @@ class Bot:
         pending = pos.get("sell_pending")
         submit_new = pending is None
 
+        if submit_new and isinstance(self.broker, LiveBroker):
+            _, preflight_reason = self.broker.sellable_amount(sym, pos["qty"], price)
+            if preflight_reason in ("below_min_amount", "below_min_notional"):
+                self._mark_dust(sym, st, pos, preflight_reason)
+                return
+            if preflight_reason:
+                self._mark_reconciliation(sym, st, preflight_reason)
+                return
+
         if submit_new:
             # Binance clientOrderId maksimal 36 karakter.
             base = sym.split("/")[0].lower()
-            client_order_id = f"rsi{int(now * 1000)}{base}"
+            client_order_id = f"rsis{int(now * 1000)}{base}"
             pos["sell_pending"] = {
                 "client_order_id": client_order_id,
                 "reason": reason,
@@ -633,6 +754,13 @@ class Bot:
             )
         else:
             res = self.broker.sell(sym, pos["qty"], price)
+
+        if isinstance(res, dict) and res.get("dust"):
+            self._mark_dust(sym, st, pos, res.get("reason", "below_minimum"))
+            return
+        if isinstance(res, dict) and res.get("reconciliation_required"):
+            self._mark_reconciliation(sym, st, res.get("reason", "no_free_balance"))
+            return
 
         if res is None:
             if not pos.get("sell_warned"):
@@ -675,6 +803,15 @@ class Bot:
             pos["oco_retry_at"] = 0
             pos.pop("oco_warned", None)
             st["status"] = "in_position"
+            if isinstance(self.broker, LiveBroker):
+                _, dust_reason = self.broker.sellable_amount(sym, remaining, float(res["price"]))
+                if dust_reason in ("below_min_amount", "below_min_notional"):
+                    self._mark_dust(sym, st, pos, dust_reason)
+                    self.notify(
+                        f"PnL fill parsial {sym}: {pnl:+.2f} {q} ({pnl_pct:+.2f}%). "
+                        f"Sisa {remaining:.8f} dicatat sebagai dust."
+                    )
+                    return
             self.save()
             self.notify(
                 f"⚠️ PARTIAL EXIT {sym} ({reason})\n"
@@ -709,6 +846,78 @@ class Bot:
                 f"Entry {fp(pos['entry'])} → Exit {fp(res['price'])}\n"
                 f"PnL {pnl:+.2f} {q} ({pnl_pct:+.2f}%)"
             )
+
+    def _finalize_buy(self, sym: str, st: dict, res: dict, now: float,
+                      tp_pct: float, r4: float, r1: float, prev: float, last: float) -> None:
+        st.pop("buy_pending", None)
+        entry = float(res["price"])
+        pos = {
+            "qty": float(res["qty"]), "entry": entry, "cost": float(res["cost"]),
+            "sl": entry * (1 - self.cfg.sl_pct / 100.0),
+            "tp": entry * (1 + tp_pct / 100.0), "tp_pct": tp_pct,
+            "opened_at": now, "oco": None,
+        }
+        st["position"] = pos
+        st["status"] = "in_position"
+        st["last_trade_ts"] = now
+        st.setdefault("entries", []).append(now)
+        self.save()
+        armed = self._arm_oco(sym, st, pos, now)
+        exit_mode = ("OCO terpasang di Binance (TP + SL)" if armed else
+                     "simulasi, dipantau bot" if self.cfg.dry_run else
+                     "dipantau bot (OCO belum terpasang, lihat peringatan)")
+        self.notify(
+            f"🟢 BUY {sym}{' [DRY RUN]' if self.cfg.dry_run else ''}\n"
+            f"Harga {fp(entry)} | Nilai {res['cost']:.2f} {self.cfg.quote} "
+            f"({self.cfg.position_pct:g}% equity)\n"
+            f"TP {fp(pos['tp'])} (+{tp_pct:g}%) | SL {fp(pos['sl'])} (-{self.cfg.sl_pct:g}%)\n"
+            f"Exit: {exit_mode}\n"
+            f"RSI 4H {r4:.1f} | 1H {r1:.1f} | 15m {prev:.1f}→{last:.1f}"
+        )
+
+    def _reconcile_buy(self, sym: str, st: dict, now: float) -> None:
+        pending = st["buy_pending"]
+        if now < float(pending.get("next_check_at", 0)):
+            return
+        try:
+            res = self.broker.buy(
+                sym, pending["cost"], pending["price"],
+                pending["client_order_id"], False,
+            )
+        except Exception as exc:
+            if type(exc).__name__ == "OrderNotFound":
+                pending["attempts"] = int(pending.get("attempts", 0)) + 1
+                pending["next_check_at"] = now + 30
+                self.save()
+                if pending["attempts"] in (1, 5, 20):
+                    self.notify(
+                        f"🚨 BUY {sym} belum ditemukan saat rekonsiliasi. "
+                        f"Tidak mengirim BUY ulang otomatis; posisi entry diblokir demi keamanan."
+                    )
+                return
+            raise
+        self._finalize_buy(
+            sym, st, res, float(pending["created_at"]), float(pending["tp_pct"]),
+            float(pending["rsi_4h"]), float(pending["rsi_1h"]),
+            float(pending["rsi_15m_prev"]), float(pending["rsi_15m_last"]),
+        )
+
+    def _begin_buy(self, sym: str, st: dict, cost: float, price: float,
+                   tp_pct: float, r4: float, r1: float, prev: float, last: float,
+                   now: float) -> None:
+        if isinstance(self.broker, LiveBroker):
+            client_order_id = f"rsib{int(now * 1000)}{sym.split('/')[0].lower()}"
+            st["buy_pending"] = {
+                "client_order_id": client_order_id, "cost": cost, "price": price,
+                "tp_pct": tp_pct, "rsi_4h": r4, "rsi_1h": r1,
+                "rsi_15m_prev": prev, "rsi_15m_last": last,
+                "created_at": now, "attempts": 0, "next_check_at": now,
+            }
+            self.save()
+            res = self.broker.buy(sym, cost, price, client_order_id, True)
+        else:
+            res = self.broker.buy(sym, cost, price)
+        self._finalize_buy(sym, st, res, now, tp_pct, r4, r1, prev, last)
 
     def _scan_entry(self, sym: str, st: dict, now: float) -> None:
         cfg = self.cfg
@@ -811,37 +1020,7 @@ class Bot:
             log.info("%s -> ditolak: nilai order %.2f di bawah minimum notional %.2f", tag, cost, mc)
             return
 
-        res = self.broker.buy(sym, cost, price)
-        entry = res["price"]
-        pos = {
-            "qty": res["qty"],
-            "entry": entry,
-            "cost": res["cost"],
-            "sl": entry * (1 - cfg.sl_pct / 100.0),
-            "tp": entry * (1 + tp_pct / 100.0),
-            "tp_pct": tp_pct,
-            "opened_at": now,
-            "oco": None,
-        }
-        st["position"] = pos
-        st["status"] = "in_position"
-        st["last_trade_ts"] = now
-        st["entries"].append(now)
-        self.save()
-        armed = self._arm_oco(sym, st, pos, now)
-        if armed:
-            exit_mode = "OCO terpasang di Binance (TP + SL)"
-        elif cfg.dry_run:
-            exit_mode = "simulasi, dipantau bot"
-        else:
-            exit_mode = "dipantau bot (OCO belum terpasang, lihat peringatan)"
-        self.notify(
-            f"🟢 BUY {sym}{' [DRY RUN]' if cfg.dry_run else ''}\n"
-            f"Harga {fp(entry)} | Nilai {res['cost']:.2f} {cfg.quote} ({cfg.position_pct:g}% equity)\n"
-            f"TP {fp(pos['tp'])} (+{tp_pct:g}%) | SL {fp(pos['sl'])} (-{cfg.sl_pct:g}%)\n"
-            f"Exit: {exit_mode}\n"
-            f"RSI 4H {r4:.1f} | 1H {r1:.1f} | 15m {prev:.1f}→{last:.1f}"
-        )
+        self._begin_buy(sym, st, cost, price, tp_pct, r4, r1, prev, last, now)
 
     # ---- loop utama --------------------------------------------------------
     def _handle_error(self, sym: str, e: Exception) -> None:
@@ -1001,9 +1180,15 @@ def main() -> int:
     if not cfg.dry_run:
         for sym, st in state["symbols"].items():
             # Posisi ber-OCO dicek statusnya di loop utama (koinnya terkunci di order, bukan "free")
-            if st["position"] and not st["position"].get("oco") and broker.base_free(sym) < st["position"]["qty"] * 0.5:
-                st.update(status="idle", position=None, need_reset=True, last_trade_ts=time.time())
-                bot.notify(f"⚠️ {sym}: saldo koin tidak sesuai state, posisi direset ke idle.")
+            if (st["position"] and not st["position"].get("oco")
+                    and broker.base_free(sym) < st["position"]["qty"] * 0.5):
+                st["status"] = "reconciliation_required"
+                st["reconciliation_reason"] = "saldo bebas jauh di bawah kuantitas posisi saat startup"
+                bot.notify(
+                    f"🚨 {sym}: saldo tidak cocok dengan state. Posisi TIDAK dihapus; "
+                    f"entry baru diblokir sampai rekonsiliasi manual."
+                )
+                bot.save()
 
     def _stop(signum, frame):
         log.info("Sinyal berhenti diterima, menutup bot...")
