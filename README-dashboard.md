@@ -10,17 +10,27 @@ Dashboard terpisah pada port 8060. File bot.py, strategi, .env, requirements.txt
 - Auto-refresh 10 detik; cache API 10 detik.
 - Tidak ada endpoint untuk membuat atau membatalkan order.
 
-## Deploy
-Salin dashboard.py dan rsi-dashboard.service.example ke /opt/rsi-binance. Lalu:
+## Deploy di VPS
+
+Pastikan perubahan dashboard diambil ke branch terpisah. Perintah ini tidak mengubah branch main:
+
+    cd /opt/rsi-binance
+    git fetch origin
+    git checkout feature/dashboard-8060
+    git pull origin feature/dashboard-8060
+
+Pasang service dashboard terpisah:
 
     sudo cp /opt/rsi-binance/rsi-dashboard.service.example /etc/systemd/system/rsi-dashboard.service
     sudo systemctl daemon-reload
     sudo systemctl enable --now rsi-dashboard
     sudo systemctl status rsi-dashboard --no-pager
 
-Service contoh bind ke 0.0.0.0:8060. Sebelum membuka port publik, batasi UFW ke IP tepercaya atau pasang reverse proxy HTTPS dengan autentikasi. Dashboard menampilkan saldo dan aktivitas akun. Untuk akses privat, ubah DASHBOARD_HOST ke 127.0.0.1 dan gunakan SSH tunnel.
+Service contoh sengaja bind ke 127.0.0.1:8060 agar saldo akun tidak terekspos langsung ke internet. Untuk membukanya dari komputer lokal, jalankan SSH tunnel dari komputer lokal:
 
-Akses: http://IP-VPS:8060
+    ssh -L 8060:127.0.0.1:8060 ubuntu@IP-VPS
+
+Lalu buka http://127.0.0.1:8060 di browser lokal. Jangan bind ke 0.0.0.0 atau membuka port publik tanpa firewall allowlist dan autentikasi HTTPS.
 
 ## Batasan perhitungan
 - Equity menjumlahkan saldo total aset yang dapat dinilai ke QUOTE_ASSET. Stablecoin umum diasumsikan setara 1 unit quote.
