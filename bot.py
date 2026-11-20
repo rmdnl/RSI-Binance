@@ -161,7 +161,7 @@ class Config:
             "TP_ATR_MULT": self.tp_atr_mult, "SL_PCT": self.sl_pct,
             "COOLDOWN_MINUTES": self.cooldown_min, "REENTRY_LOCKOUT_MINUTES": self.lockout_min,
             "ENTRY_WINDOW_HOURS": self.entry_window_hours, "LOOP_SECONDS": self.loop_seconds,
-            "PAPER_FEE_PCT": self.paper_fee_pct,
+            "PAPER_FEE_PCT": self.paper_fee_pct, "DRY_RUN_BALANCE": self.dry_run_balance,
         }
         for name, value in numeric_values.items():
             if not math.isfinite(float(value)):
@@ -378,12 +378,21 @@ class LiveBroker:
         market = self.ex.market(sym)
         info = market.get("info") or {}
         filters = {x.get("filterType"): x for x in (info.get("filters") or [])}
+        if free + max(float(qty) * 1e-8, 1e-12) < float(qty):
+            return 0.0, "balance_mismatch"
         market_lot = filters.get("MARKET_LOT_SIZE") or {}
-        min_amount = float(market_lot.get("minQty") or
-                           ((market.get("limits") or {}).get("amount") or {}).get("min") or 0)
+        market_min = float(market_lot.get("minQty") or 0)
+        lot_min = float(((market.get("limits") or {}).get("amount") or {}).get("min") or 0)
+        min_amount = max(market_min, lot_min)
         min_cost = float(((market.get("limits") or {}).get("cost") or {}).get("min") or 0)
-        notional = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL") or {}
-        min_cost = max(min_cost, float(notional.get("minNotional") or 0))
+        if "NOTIONAL" in filters:
+            nf = filters["NOTIONAL"]
+            if nf.get("applyMinToMarket", True):
+                min_cost = max(min_cost, float(nf.get("minNotional") or 0))
+        elif "MIN_NOTIONAL" in filters:
+            nf = filters["MIN_NOTIONAL"]
+            if nf.get("applyToMarket", True):
+                min_cost = max(min_cost, float(nf.get("minNotional") or 0))
         if rounded <= 0 or rounded < min_amount:
             return 0.0, "below_min_amount"
         if min_cost and rounded * float(price) < min_cost:
@@ -465,7 +474,7 @@ class LiveBroker:
             raise RuntimeError(f"{sym} tidak mendukung OCO (ocoAllowed/LIMIT_MAKER)")
         info = self.ex.market(sym).get("info") or {}
         types = info.get("orderTypes") or []
-        q, reason = self.sellable_amount(sym, qty, tp_price)
+        q, reason = self.sellable_amount(sym, qty, sl_stop)
         if reason:
             raise RuntimeError(f"Qty OCO {sym} tidak dapat diperdagangkan: {reason}")
         q = self.ex.amount_to_precision(sym, q)
@@ -673,7 +682,7 @@ class Bot:
             if existing:
                 oco = existing
             else:
-                qty, reason = self.broker.sellable_amount(sym, pos["qty"], pos["tp"])
+                qty, reason = self.broker.sellable_amount(sym, pos["qty"], pos["sl"])
                 if reason in ("below_min_amount", "below_min_notional"):
                     self._mark_dust(sym, st, pos, reason)
                     return False
@@ -977,7 +986,10 @@ class Bot:
             log.info("%s -> ditahan: batas %d entry per %g jam tercapai", tag, cfg.max_entries_window,
                      cfg.entry_window_hours)
             return
-        open_count = sum(1 for s in self.state["symbols"].values() if s["status"] == "in_position")
+        open_count = sum(
+            1 for s in self.state["symbols"].values()
+            if s.get("position") is not None or s.get("buy_pending")
+        )
         if open_count >= cfg.max_open:
             log.info("%s -> ditahan: posisi terbuka sudah %d (maks %d)", tag, open_count, cfg.max_open)
             return
