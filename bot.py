@@ -412,7 +412,7 @@ class LiveBroker:
 
         if submit_new:
             q, reason = self.sellable_amount(sym, qty, last_price)
-            if reason == "no_free_balance":
+            if reason in ("no_free_balance", "balance_mismatch"):
                 return {"reconciliation_required": True, "reason": reason}
             if reason:
                 return {"dust": True, "reason": reason}
