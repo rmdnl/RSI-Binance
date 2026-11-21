@@ -1,6 +1,6 @@
 # RSI Binance bot
 
-Spot bot RSI multi-pair Binance. Audit/safety patch is read-only with respect to the account: no exchange operation is performed by the dashboard.
+Spot bot RSI multi-pair Binance. The dashboard reads a portfolio snapshot written by the bot; it never submits orders.
 
 ## Run
 
@@ -12,17 +12,15 @@ cp env.example .env
 python bot.py
 ```
 
-Live trading is high risk. Test in dry-run and Binance testnet first. If an order submission or OCO response is ambiguous, the bot intentionally persists a pending intent and freezes that pair instead of retrying automatically. Check the Binance account and reconcile the state before manually clearing that intent. Never delete a pending order marker just to resume trading.
+Live trading is high risk. Test dry-run and Binance testnet first. Ambiguous order outcomes are persisted and freeze the affected pair; reconcile with Binance before resuming. Realized PnL is tracked by this bot from the time tracking begins and excludes manual trades or earlier history. Live equity is an estimate in QUOTE_ASSET; assets without a matching quote market are shown but excluded from the valuation.
 
-## Read-only web dashboard (port 8060)
+## Read-only portfolio dashboard (port 8060)
 
-Start separately from the bot:
+Run the bot, then separately run `python dashboard.py`. Open `http://127.0.0.1:8060`. Dashboard displays estimated equity, bot positions, wallet coin balances, unrealized PnL, and bot-tracked realized PnL. It refreshes every five seconds from the portfolio snapshot in `state.json`. Its default bind is localhost; use SSH tunneling for remote viewing. Do not expose it publicly without authentication and TLS.
 
 ```bash
-python dashboard.py
+ssh -L 8060:127.0.0.1:8060 user@your-vps
 ```
-
-Open `http://127.0.0.1:8060`. The dashboard has no trading controls and reads only `STATE_FILE`. It binds to localhost by default. To access remotely, use an SSH tunnel, for example `ssh -L 8060:127.0.0.1:8060 user@your-vps`. Do not bind it to `0.0.0.0` or expose it publicly without adding authentication and TLS. Set `DASHBOARD_PORT` or `DASHBOARD_HOST` only if you understand the exposure.
 
 ## Tests
 
@@ -30,4 +28,4 @@ Open `http://127.0.0.1:8060`. The dashboard has no trading controls and reads on
 pytest -q
 ```
 
-Tests do not send orders or connect to Binance. A passing test suite does not establish that exchange execution, OCO behavior, or a strategy is profitable. Do not use live funds without testnet validation and manual reconciliation procedures.
+Tests do not send orders or connect to Binance. Passing tests do not establish exchange execution safety or profitability. Verify state and figures against Binance/testnet before live use.
