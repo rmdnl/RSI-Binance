@@ -41,7 +41,7 @@ Bot trading **Binance Spot multi-pair** berbasis konfirmasi RSI 15 menit dengan 
 - Pemantauan TP/SL oleh bot sebagai fallback ketika OCO tidak digunakan.
 - Penyimpanan state atomik untuk pemulihan setelah restart.
 - Estimasi realized PnL, unrealized PnL, dan portfolio.
-- Dashboard read-only dengan refresh otomatis setiap 5 detik.
+- Dashboard read-only dengan refresh otomatis setiap 5 detik dan diagnostik RSI per pair.
 - Log aplikasi dan notifikasi Telegram opsional.
 - Cache harga, throttling request, serta penanganan kondisi order yang hasilnya belum pasti.
 
@@ -489,6 +489,7 @@ Dashboard melakukan refresh otomatis setiap **5 detik**.
 Informasi yang ditampilkan:
 
 - Mode bot dan quote asset.
+- Diagnostik RSI 15m per pair, alasan setup belum lolos, serta RSI konteks 1H/4H ketika setup awal 15m terpenuhi.
 - Equity estimasi.
 - Unrealized PnL dan realized PnL.
 - Daftar posisi bot, kuantitas, entry, mark price, nilai, TP, dan SL.
@@ -741,6 +742,7 @@ Unit test yang tersedia mencakup:
 - True Range ATR yang memperhitungkan previous close.
 - Validasi konfigurasi integer.
 - Penolakan nilai numerik non-finite.
+- Pencatatan diagnostik RSI saat kondisi oversold belum terpenuhi.
 
 Unit test tidak mengirim order dan tidak membuktikan profitabilitas atau keamanan seluruh skenario live.
 
