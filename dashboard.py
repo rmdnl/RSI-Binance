@@ -3,7 +3,7 @@ from __future__ import annotations
 import json, os, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HOST=os.getenv("DASHBOARD_HOST","127.0.0.1");PORT=int(os.getenv("DASHBOARD_PORT","8060"));STATE_FILE=os.getenv("STATE_FILE","state.json")
-PAGE=b'''<!doctype html><html lang="id"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>RSI Bot Operations</title><style>
+PAGE='''<!doctype html><html lang="id"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>RSI Bot Operations</title><style>
 body{font:15px system-ui;background:#10151d;color:#e8eef6;margin:2rem}h1{color:#7dd3fc}.muted{color:#aab8ca}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.card{background:#1b2532;padding:1rem;border-radius:10px;overflow:auto}.value{font-size:1.35rem;font-weight:700;margin-top:.4rem}table{width:100%;border-collapse:collapse;min-width:650px}td,th{text-align:left;padding:.6rem;border-bottom:1px solid #344256}.warn{color:#fbbf24}.error{color:#fca5a5}.info{color:#93c5fd}.pos{color:#86efac}.neg{color:#fca5a5}section{margin-top:1.4rem}.event{padding:.55rem;border-bottom:1px solid #344256;white-space:pre-wrap;overflow-wrap:anywhere}
 </style><h1>RSI Binance — Portfolio &amp; health</h1><p id="meta" class="muted">Memuat snapshot…</p><div id="content"></div><script>
 const fmt=(x,n=4)=>x==null?'—':Number(x).toLocaleString(undefined,{maximumFractionDigits:n});const safe=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -19,7 +19,7 @@ refresh();setInterval(refresh,5000);
 </script></html>'''
 class Handler(BaseHTTPRequestHandler):
  def do_GET(self):
-  if self.path=='/':body=PAGE;status=200;ctype='text/html; charset=utf-8'
+  if self.path=='/':body=PAGE.encode('utf-8');status=200;ctype='text/html; charset=utf-8'
   elif self.path=='/api/status':
    try:
     with open(STATE_FILE,encoding='utf-8') as f:state=json.load(f)
