@@ -253,27 +253,53 @@ class Bot:
         if st["last_eval_ts"]>=expected:return
         candles=closed(self.ex.fetch_ohlcv(s,"15m",limit=300),TF_MS["15m"],now_ms)
         if len(candles)<self.cfg.period+self.cfg.arm+2 or candles[-1][0]<=st["last_eval_ts"]:return
-        st["last_eval_ts"]=candles[-1][0];self.save();values=rsi_series([x[4] for x in candles],self.cfg.period);prev,last=values[-2:]
-        if prev is None or last is None:return
+        st["last_eval_ts"]=candles[-1][0]
+        values=rsi_series([x[4] for x in candles],self.cfg.period);prev,last=values[-2:]
+        diag={"evaluated_at":now,"candle_ts":candles[-1][0],"rsi_15m_previous":prev,"rsi_15m":last,"rsi_1h":None,"rsi_4h":None,"oversold_seen":False,"trigger_cross":False,"reason":""}
+        st["diagnostics"]=diag
+        def finish(reason):
+            diag["reason"]=reason
+            self.save()
+        if prev is None or last is None:
+            finish("Data belum cukup untuk menghitung RSI 15m");return
         if st["need_reset"] and any(x[0]>=st["last_trade_ts"]*1000 and y is not None and y>=self.cfg.rearm for x,y in zip(candles,values)):st["need_reset"]=False
         look=[x for x in values[-1-self.cfg.arm:-1] if x is not None]
-        if st["need_reset"] or not(prev<=self.cfg.trigger<last and look and min(look)<self.cfg.oversold):return
-        if now-st["last_trade_ts"]<self.cfg.lockout*60:return
+        diag["oversold_seen"]=bool(look and min(look)<self.cfg.oversold)
+        diag["trigger_cross"]=bool(prev<=self.cfg.trigger<last)
+        if st["need_reset"]:
+            finish(f"Menunggu RSI re-arm ke {self.cfg.rearm:g}");return
+        if not diag["oversold_seen"]:
+            finish(f"Belum ada RSI 15m di bawah oversold {self.cfg.oversold:g} pada lookback");return
+        if not diag["trigger_cross"]:
+            finish(f"Belum ada crossing RSI 15m ke atas trigger {self.cfg.trigger:g}");return
+        if now-st["last_trade_ts"]<self.cfg.lockout*60:
+            finish("Menunggu re-entry lockout");return
         st["entries"]=[t for t in st["entries"] if now-t<self.cfg.window_hours*3600]
-        if len(st["entries"])>=self.cfg.max_entries or sum(x["status"]=="in_position" for x in self.state["symbols"].values())>=self.cfg.max_open:return
+        if len(st["entries"])>=self.cfg.max_entries:
+            finish("Batas entry per window sudah tercapai");return
+        if sum(x["status"]=="in_position" for x in self.state["symbols"].values())>=self.cfg.max_open:
+            finish("Batas posisi terbuka sudah tercapai");return
         c4raw=self.ex.fetch_ohlcv(s,"4h",limit=300);c1raw=self.ex.fetch_ohlcv(s,"1h",limit=300)
         c4=closed(c4raw,TF_MS["4h"],now_ms) if self.cfg.context_closed else c4raw;c1=closed(c1raw,TF_MS["1h"],now_ms) if self.cfg.context_closed else c1raw
         r4,r1=rsi_series([x[4] for x in c4],self.cfg.period),rsi_series([x[4] for x in c1],self.cfg.period)
-        if not r4 or not r1 or r4[-1] is None or r1[-1] is None or not(r4[-1]<self.cfg.max4 and r1[-1]<self.cfg.max1):return
+        diag["rsi_4h"]=r4[-1] if r4 and r4[-1] is not None else None
+        diag["rsi_1h"]=r1[-1] if r1 and r1[-1] is not None else None
+        if diag["rsi_4h"] is None or diag["rsi_1h"] is None:
+            finish("Data candle belum cukup untuk RSI konteks 1h/4h");return
+        if not(diag["rsi_4h"]<self.cfg.max4 and diag["rsi_1h"]<self.cfg.max1):
+            finish(f"Filter konteks gagal: RSI 4h harus < {self.cfg.max4:g} dan RSI 1h harus < {self.cfg.max1:g}");return
         atr=atr_pct(closed(c1raw,TF_MS["1h"],now_ms));tp=round(min(self.cfg.tp_max,max(self.cfg.tp_min,(atr or 0)*self.cfg.tp_atr)),2)
         price=self.price(s);free=self.broker.quote_free();equity=free
         for pair,x in self.state["symbols"].items():
             if x.get("position"):equity+=float(x["position"]["qty"])*self.price(pair)
         cost=equity*self.cfg.position_pct/100;minimum=((self.ex.market(s).get("limits") or {}).get("cost") or {}).get("min") or 0
-        if cost>free or(minimum and cost<float(minimum)):return
-        cid="rsi-b-"+uuid.uuid4().hex[:24];st["pending_order"]={"type":"buy","client_id":cid,"cost":cost,"created_at":now};self.save();result=self.broker.buy(s,cost,price,cid)
+        if cost>free:
+            finish("Saldo quote tidak cukup untuk ukuran posisi");return
+        if minimum and cost<float(minimum):
+            finish("Nilai order di bawah minimum exchange");return
+        cid="rsi-b-"+uuid.uuid4().hex[:24];st["pending_order"]={"type":"buy","client_id":cid,"cost":cost,"created_at":now};diag["reason"]="Kondisi entry lolos; order BUY sedang diproses";self.save();result=self.broker.buy(s,cost,price,cid)
         p={"qty":result["qty"],"entry":result["price"],"cost":result["cost"],"sl":result["price"]*(1-self.cfg.sl_pct/100),"tp":result["price"]*(1+tp/100),"tp_pct":tp,"opened_at":now,"oco":None,"buy_order_id":result["id"]}
-        st["pending_order"]=None;st.update(status="in_position",position=p,last_trade_ts=now);st["entries"].append(now);self.save()
+        st["pending_order"]=None;st.update(status="in_position",position=p,last_trade_ts=now);st["entries"].append(now);diag["reason"]="BUY berhasil dibuka"+(" (DRY RUN)" if self.cfg.dry_run else "");self.save()
         if not self.cfg.dry_run and self.cfg.use_oco:self.arm_oco(s,st,p)
         self.notify(f"BUY {s}{' [DRY RUN]' if self.cfg.dry_run else ''} @ {result['price']:g}; TP {p['tp']:g}, SL {p['sl']:g}")
     def handle_exception(self,s,exc):
