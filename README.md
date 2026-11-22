@@ -489,7 +489,7 @@ Dashboard melakukan refresh otomatis setiap **5 detik**.
 Informasi yang ditampilkan:
 
 - Mode bot dan quote asset.
-- Diagnostik RSI 15m per pair, alasan setup belum lolos, serta RSI konteks 1H/4H ketika setup awal 15m terpenuhi.
+- Diagnostik RSI per pair dan grafik interaktif tren RSI 15m/1h/4h selama 24 jam terakhir untuk pair yang dipilih. Histori memakai candle tertutup dan disimpan dalam state.
 - Equity estimasi.
 - Unrealized PnL dan realized PnL.
 - Daftar posisi bot, kuantitas, entry, mark price, nilai, TP, dan SL.
