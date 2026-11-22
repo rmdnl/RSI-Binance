@@ -57,3 +57,23 @@ def test_scan_entry_records_rsi_diagnostic_when_oversold_is_absent(monkeypatch):
     assert diagnostic["oversold_seen"] is False
     assert "Belum ada RSI 15m" in diagnostic["reason"]
 
+
+def test_update_rsi_history_keeps_closed_samples_for_last_24_hours():
+    from bot import update_rsi_history
+
+    now_ms = 1_800_000_000_000
+    tf_ms = 900_000
+    start = now_ms - 30 * tf_ms
+    candles = []
+    for index in range(30):
+        close = 100 + index
+        candles.append([start + index * tf_ms, close, close, close, close, 1])
+
+    history = {}
+    rows = update_rsi_history(history, "15m", candles, 14, now_ms)
+
+    assert rows
+    assert len(rows) <= 100
+    assert all(row["timestamp"] + tf_ms <= now_ms for row in rows)
+    assert all(row["timestamp"] >= now_ms - 24 * 60 * 60 * 1000 for row in rows)
+    assert rows[-1]["value"] == 100.0
