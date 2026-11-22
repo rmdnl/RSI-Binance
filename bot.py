@@ -66,6 +66,18 @@ def rsi_series(closes,period=14):
         d=closes[i]-closes[i-1];ag=(ag*(period-1)+max(d,0))/period;al=(al*(period-1)+max(-d,0))/period;out[i]=_rsi_value(ag,al)
     return out
 
+def update_rsi_history(history,timeframe,candles,period,now_ms):
+    """Keep closed-candle RSI samples from the trailing 24 hours."""
+    tf_ms=TF_MS[timeframe];cutoff=now_ms-24*60*60*1000
+    rows={int(x["timestamp"]):float(x["value"]) for x in history.get(timeframe,[]) if x.get("timestamp") is not None and x.get("value") is not None and int(x["timestamp"])>=cutoff}
+    values=rsi_series([x[4] for x in candles],period)
+    for candle,value in zip(candles,values):
+        ts=int(candle[0])
+        if ts>=cutoff and ts+tf_ms<=now_ms and value is not None and math.isfinite(float(value)):
+            rows[ts]=float(value)
+    history[timeframe]=[{"timestamp":ts,"value":rows[ts]} for ts in sorted(rows)][-100:]
+    return history[timeframe]
+
 def closed(candles,tf_ms,now_ms): return [c for c in candles if int(c[0])+tf_ms<=now_ms]
 def atr_pct(candles,period=14):
     if len(candles)<period+1:return None
@@ -255,7 +267,18 @@ class Bot:
         if len(candles)<self.cfg.period+self.cfg.arm+2 or candles[-1][0]<=st["last_eval_ts"]:return
         st["last_eval_ts"]=candles[-1][0]
         values=rsi_series([x[4] for x in candles],self.cfg.period);prev,last=values[-2:]
-        diag={"evaluated_at":now,"candle_ts":candles[-1][0],"rsi_15m_previous":prev,"rsi_15m":last,"rsi_1h":None,"rsi_4h":None,"oversold_seen":False,"trigger_cross":False,"reason":""}
+        # Persist closed-candle RSI history for all chart timeframes once per new 15m candle.
+        c4raw=self.ex.fetch_ohlcv(s,"4h",limit=100);c1raw=self.ex.fetch_ohlcv(s,"1h",limit=100)
+        c4closed=closed(c4raw,TF_MS["4h"],now_ms);c1closed=closed(c1raw,TF_MS["1h"],now_ms)
+        history=st.setdefault("rsi_history",{})
+        update_rsi_history(history,"15m",candles,self.cfg.period,now_ms)
+        update_rsi_history(history,"1h",c1closed,self.cfg.period,now_ms)
+        update_rsi_history(history,"4h",c4closed,self.cfg.period,now_ms)
+        r1_chart=rsi_series([x[4] for x in c1closed],self.cfg.period)
+        r4_chart=rsi_series([x[4] for x in c4closed],self.cfg.period)
+        rsi1_chart=r1_chart[-1] if r1_chart and r1_chart[-1] is not None else None
+        rsi4_chart=r4_chart[-1] if r4_chart and r4_chart[-1] is not None else None
+        diag={"evaluated_at":now,"candle_ts":candles[-1][0],"rsi_15m_previous":prev,"rsi_15m":last,"rsi_1h":rsi1_chart,"rsi_4h":rsi4_chart,"oversold_seen":False,"trigger_cross":False,"reason":""}
         st["diagnostics"]=diag
         def finish(reason):
             diag["reason"]=reason
@@ -279,11 +302,8 @@ class Bot:
             finish("Batas entry per window sudah tercapai");return
         if sum(x["status"]=="in_position" for x in self.state["symbols"].values())>=self.cfg.max_open:
             finish("Batas posisi terbuka sudah tercapai");return
-        c4raw=self.ex.fetch_ohlcv(s,"4h",limit=300);c1raw=self.ex.fetch_ohlcv(s,"1h",limit=300)
         c4=closed(c4raw,TF_MS["4h"],now_ms) if self.cfg.context_closed else c4raw;c1=closed(c1raw,TF_MS["1h"],now_ms) if self.cfg.context_closed else c1raw
         r4,r1=rsi_series([x[4] for x in c4],self.cfg.period),rsi_series([x[4] for x in c1],self.cfg.period)
-        diag["rsi_4h"]=r4[-1] if r4 and r4[-1] is not None else None
-        diag["rsi_1h"]=r1[-1] if r1 and r1[-1] is not None else None
         if diag["rsi_4h"] is None or diag["rsi_1h"] is None:
             finish("Data candle belum cukup untuk RSI konteks 1h/4h");return
         if not(diag["rsi_4h"]<self.cfg.max4 and diag["rsi_1h"]<self.cfg.max1):
