@@ -268,7 +268,7 @@ class Bot:
         st["last_eval_ts"]=candles[-1][0]
         values=rsi_series([x[4] for x in candles],self.cfg.period);prev,last=values[-2:]
         # Persist closed-candle RSI history for all chart timeframes once per new 15m candle.
-        c4raw=self.ex.fetch_ohlcv(s,"4h",limit=100);c1raw=self.ex.fetch_ohlcv(s,"1h",limit=100)
+        c4raw=self.ex.fetch_ohlcv(s,"4h",limit=300);c1raw=self.ex.fetch_ohlcv(s,"1h",limit=300)
         c4closed=closed(c4raw,TF_MS["4h"],now_ms);c1closed=closed(c1raw,TF_MS["1h"],now_ms)
         history=st.setdefault("rsi_history",{})
         update_rsi_history(history,"15m",candles,self.cfg.period,now_ms)
