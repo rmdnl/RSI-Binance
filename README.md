@@ -294,6 +294,23 @@ Untuk mengaktifkannya:
 
 Notifikasi hanya aktif jika token dan chat ID sama-sama tersedia. Jika salah satu variabel kosong, bot tetap berjalan tanpa notifikasi dan menulis warning `Telegram tidak dikonfigurasi` di log saat startup.
 
+Semua kegagalan yang terjadi sebelum loop utama berjalan juga dikirim ke Telegram, bukan hanya tercatat di log: gagal menyiapkan exchange, state yang perlu rekonsiliasi manual, saldo gagal dibaca, rekonsiliasi startup gagal, dan proses lain yang masih memegang lock. Kegagalan pengiriman Telegram sendiri dicatat di log beserta status HTTP dan badan respons, misalnya `Telegram gagal: HTTP 401 {"description":"Unauthorized"}`.
+
+Untuk memastikan jalur notifikasi berfungsi tanpa menjalankan bot:
+
+```bash
+cd /path/ke/repository
+python3 -c "
+import os, bot
+bot.load_dotenv(os.path.join(os.getcwd(), '.env'))
+cfg = bot.Config.from_env()
+print('token terisi:', bool(cfg.tg_token), '| chat:', cfg.tg_chat)
+bot.Notifier(cfg.tg_token, cfg.tg_chat).send('uji notifikasi manual')
+"
+```
+
+Jika token terisi dan pesan uji sampai, tetapi notifikasi startup tetap tidak muncul, kemungkinan besar proses berhenti di salah satu jalur sebelum `run()`; periksa `journalctl -u <service> -n 100 --no-pager` atau `bot.log`.
+
 ### 4. Parameter RSI
 
 ```dotenv
@@ -745,7 +762,7 @@ Jalankan dari direktori repository dengan virtual environment aktif:
 pytest -q
 ```
 
-Unit test yang tersedia (`tests/test_safety.py` dan `tests/test_backtest.py`, 20 kasus) mencakup:
+Unit test yang tersedia (`tests/test_safety.py`, `tests/test_backtest.py`, dan `tests/test_notifier.py`; 25 kasus) mencakup:
 
 - RSI pada data yang naik monotonis bernilai 100.
 - RSI pada data flat bernilai 100 (regresi sentinel lama `50`).
@@ -767,6 +784,9 @@ Unit test yang tersedia (`tests/test_safety.py` dan `tests/test_backtest.py`, 20
 - Net return backtest pada jalur SL sama dengan rumus `(entry*(1-SL%)*(1-slip)/entry)*(1-fee)^2-1`.
 - Net return backtest pada jalur TP sama dengan rumus `(1+TP%)*(1-fee)^2-1`.
 - Backtest menghitung sinyal yang diblok lockout/max-entries pada kolom `ditahan`.
+- Notifier tidak mengirim apa pun bila token/chat ID kosong, dan mencatat status HTTP serta tipe exception saat pengiriman gagal.
+- `run()` memancarkan notifikasi start lalu stop meskipun loop langsung dihentikan.
+- Hanya ada satu pembuatan `Notifier` di `main()` dan setiap jalur keluar sebelum `run()` mengirim peringatan.
 
 Unit test tidak mengirim order dan tidak membuktikan profitabilitas atau keamanan seluruh skenario live.
 
@@ -783,6 +803,13 @@ Pastikan virtual environment aktif, kemudian jalankan:
 ```bash
 pip install -r requirements.txt
 ```
+
+### Notifikasi Telegram tidak muncul
+
+1. Pastikan `.env` berada di direktori yang sama dengan `bot.py` dan berisi `TELEGRAM_BOT_TOKEN` serta `TELEGRAM_CHAT_ID`.
+2. Cari baris `Telegram tidak dikonfigurasi` atau `Telegram gagal: HTTP 4xx` di log dan `journalctl`.
+3. Periksa kode keluar proses. Kode `2` berarti bot berhenti sebelum loop utama; pesannya dikirim ke Telegram bila token valid.
+4. Kirim pesan uji dengan perintah `python3 -c` pada seksi Telegram di atas untuk memisahkan masalah kredensial dari masalah jalur startup.
 
 ### File `.env` tidak terbaca
 
@@ -823,7 +850,8 @@ RSI-Binance/
 ├── requirements.txt     # Dependensi Python
 ├── tests/
 │   ├── test_safety.py   # Unit test keselamatan dan indikator
-│   └── test_backtest.py # Unit test parser dan matematika backtest
+│   ├── test_backtest.py # Unit test parser dan matematika backtest
+│   └── test_notifier.py # Unit test jalur notifikasi Telegram tanpa jaringan
 └── README.md            # Dokumentasi proyek
 ```
 

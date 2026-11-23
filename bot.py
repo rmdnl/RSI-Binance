@@ -235,9 +235,10 @@ class Notifier:
                 timeout=10,
             )
             if not response.ok:
-                log.warning("Telegram gagal: HTTP %s", response.status_code)
-        except Exception:
-            log.warning("Telegram gagal")
+                log.warning("Telegram gagal: HTTP %s %s",
+                            response.status_code, str(getattr(response, "text", ""))[:200])
+        except Exception as exc:
+            log.warning("Telegram gagal: %s: %s", type(exc).__name__, str(exc)[:200])
 
 
 class PaperBroker:
@@ -951,25 +952,33 @@ def main() -> int:
         handlers=[logging.StreamHandler(), RotatingFileHandler(cfg.log_file, maxBytes=2_000_000, backupCount=3, encoding="utf-8")],
         format="%(asctime)s %(levelname)s %(message)s")
 
+    notifier = Notifier(cfg.tg_token, cfg.tg_chat)
+    if not (cfg.tg_token and cfg.tg_chat):
+        log.warning("Telegram tidak dikonfigurasi (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID kosong); "
+                    "notifikasi start/stop/trade dinonaktifkan")
+
     ex = ccxt.binance({"apiKey": cfg.key or None, "secret": cfg.secret or None,
                        "enableRateLimit": True, "timeout": 20000,
                        "options": {"defaultType": "spot", "adjustForTimeDifference": True}})
-    if cfg.testnet:
-        ex.set_sandbox_mode(True)
-    ex.load_markets()
-    cfg.symbols = resolve_symbols(ex, cfg.symbols, cfg.quote)
+    try:
+        if cfg.testnet:
+            ex.set_sandbox_mode(True)
+        ex.load_markets()
+        cfg.symbols = resolve_symbols(ex, cfg.symbols, cfg.quote)
+    except Exception as exc:
+        log.exception("Gagal menyiapkan exchange")
+        notifier.send("Bot tidak dijalankan: gagal menyiapkan exchange "
+                      f"({type(exc).__name__}: {str(exc)[:160]})")
+        return 2
 
     try:
         state = new_state(cfg.state_file, cfg)
     except Exception as exc:
         log.error("State perlu rekonsiliasi manual: %s", exc)
+        notifier.send(f"Bot tidak dijalankan: state perlu rekonsiliasi manual ({exc})")
         return 2
 
     broker = PaperBroker(state, cfg.paper_fee) if cfg.dry_run else LiveBroker(ex, cfg.quote)
-    notifier = Notifier(cfg.tg_token, cfg.tg_chat)
-    if not (cfg.tg_token and cfg.tg_chat):
-        log.warning("Telegram tidak dikonfigurasi (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID kosong); "
-                    "notifikasi start/stop/trade dinonaktifkan")
 
     try:
         with ProcessLock(cfg.state_file):
@@ -979,13 +988,21 @@ def main() -> int:
                     broker.quote_free()
                 except Exception as exc:
                     log.error("Gagal membaca saldo: %s", type(exc).__name__)
+                    notifier.send(f"Bot tidak dijalankan: gagal membaca saldo ({type(exc).__name__})")
                     return 2
-            bot.reconcile_startup()
+            try:
+                bot.reconcile_startup()
+            except Exception as exc:
+                log.exception("Rekonsiliasi startup gagal")
+                notifier.send("Bot tidak dijalankan: rekonsiliasi startup gagal "
+                              f"({type(exc).__name__}: {str(exc)[:160]})")
+                return 2
             signal.signal(signal.SIGINT, lambda *_: setattr(bot, "running", False))
             signal.signal(signal.SIGTERM, lambda *_: setattr(bot, "running", False))
             bot.run()
     except RuntimeError as exc:
         log.error("%s", exc)
+        notifier.send(f"Bot tidak dijalankan: {exc}")
         return 2
     return 0
 
