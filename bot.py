@@ -3,7 +3,6 @@
 """Binance spot RSI bot with conservative P0 safety controls."""
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
 import math
@@ -19,6 +18,7 @@ from typing import Any, Optional
 
 import ccxt
 from dotenv import load_dotenv
+from filelock import FileLock
 
 log = logging.getLogger("bot")
 TF_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
@@ -128,7 +128,7 @@ class Config:
 
 def _rsi_value(avg_gain: float, avg_loss: float) -> float:
     if avg_loss == 0:
-        return 50.0 if avg_gain == 0 else 100.0
+        return 100.0
     return 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
 
 
@@ -155,14 +155,15 @@ def closed(candles: list[list], tf_ms: int, now_ms: int) -> list[list]:
     return [c for c in candles if int(c[0]) + tf_ms <= now_ms]
 
 
-def atr_pct(candles: list[list], period: int = 14) -> Optional[float]:
+def atr_pct(candles: list[list], period: int = 14, current_price: Optional[float] = None) -> Optional[float]:
     if len(candles) < period + 1:
         return None
     trs = [max(c[2] - c[3], abs(c[2] - p[4]), abs(c[3] - p[4])) for p, c in zip(candles, candles[1:])]
     atr = sum(trs[:period]) / period
     for tr in trs[period:]:
         atr = (atr * (period - 1) + tr) / period
-    return atr / candles[-1][4] * 100 if candles[-1][4] > 0 else None
+    ref_price = current_price if (current_price and current_price > 0) else candles[-1][4]
+    return atr / ref_price * 100 if ref_price > 0 else None
 
 
 def update_rsi_history(history: dict, timeframe: str, candles: list[list], period: int, now_ms: int) -> list:
@@ -183,28 +184,20 @@ def update_rsi_history(history: dict, timeframe: str, candles: list[list], perio
 
 class ProcessLock:
     def __init__(self, state_file: str):
-        self.path = state_file + ".lock"
-        self.file = None
+        self.lock = FileLock(state_file + ".lock", timeout=0)
 
     def __enter__(self):
-        self.file = open(self.path, "a+", encoding="utf-8")
         try:
-            fcntl.flock(self.file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            self.file.close()
-            raise RuntimeError(f"Bot sudah berjalan; lock aktif: {self.path}")
-        self.file.seek(0)
-        self.file.truncate()
-        self.file.write(str(os.getpid()))
-        self.file.flush()
+            self.lock.acquire()
+        except Exception:
+            raise RuntimeError(f"Bot sudah berjalan; lock aktif: {self.lock.lock_file}")
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if self.file:
-            try:
-                fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
-            finally:
-                self.file.close()
+        try:
+            self.lock.release()
+        except Exception:
+            pass
 
 
 class Notifier:
@@ -268,8 +261,7 @@ class LiveBroker:
     def buy(self, symbol, cost, price, client_id):
         cost = float(self.ex.cost_to_precision(symbol, cost))
         order = self.ex.create_market_buy_order_with_cost(symbol, cost, {"newClientOrderId": client_id})
-        if order.get("average") is None or order.get("filled") is None:
-            order = self.ex.fetch_order(order["id"], symbol)
+        order = self._await_final_order(order, symbol)
         filled = float(order.get("filled") or 0)
         status = str(order.get("status") or "").lower()
         if filled <= 0 or status not in {"closed", "filled"}:
@@ -281,17 +273,38 @@ class LiveBroker:
         avg = float(order.get("average") or price)
         return {"id": str(order["id"]), "qty": qty, "price": avg, "cost": float(order.get("cost") or filled * avg)}
 
+    def _await_final_order(self, order: dict, symbol: str, attempts: int = 5, base_delay: float = 0.4) -> dict:
+        """Poll fetch_order until terminal or attempts exhausted (fill propagation race)."""
+        status = str((order or {}).get("status") or "").lower()
+        filled = float((order or {}).get("filled") or 0)
+        if order and order.get("average") is not None and filled > 0 and status in TERMINAL:
+            return order
+        oid = (order or {}).get("id")
+        if oid is None:
+            return order
+        delay = base_delay
+        for _ in range(attempts):
+            time.sleep(delay)
+            delay = min(delay * 1.6, 3.0)
+            try:
+                order = self.ex.fetch_order(str(oid), symbol)
+            except Exception:
+                continue
+            status = str(order.get("status") or "").lower()
+            if status in TERMINAL:
+                return order
+        return order
+
     def sell(self, symbol, qty, price, client_id):
         qty = float(self.ex.amount_to_precision(symbol, min(qty, self.base_free(symbol))))
         minimum = ((self.ex.market(symbol).get("limits") or {}).get("amount") or {}).get("min") or 0
         if qty <= 0 or qty < float(minimum):
             return None
         order = self.ex.create_market_sell_order(symbol, qty, {"newClientOrderId": client_id})
-        if order.get("average") is None or order.get("filled") is None:
-            order = self.ex.fetch_order(order["id"], symbol)
+        order = self._await_final_order(order, symbol)
         status = str(order.get("status") or "").lower()
         if status not in TERMINAL:
-            raise RuntimeError(f"sell belum final: status={status or 'unknown'}")
+            raise RuntimeError(f"sell belum final: order={order.get('id')} status={status or 'unknown'}")
         filled = float(order.get("filled") or 0)
         avg = float(order.get("average") or price)
         proceeds = float(order.get("cost") or filled * avg)
@@ -310,7 +323,7 @@ class LiveBroker:
             "belowType": "STOP_LOSS", "belowStopPrice": self.ex.price_to_precision(symbol, sl),
             "listClientOrderId": client_id,
         }
-        result = self.ex.request("orderList/oco", "private", "POST", params)
+        result = self.ex.private_post_orderlist_oco(params)
         tp_id = sl_id = None
         for leg in result.get("orderReports") or []:
             if str(leg.get("type", "")).upper().startswith("STOP_LOSS"):
@@ -509,7 +522,9 @@ class Bot:
         self.exit_market(symbol, st, reason, mark, now)
 
     def arm_oco(self, symbol: str, st: dict, pos: dict):
-        cid = pos.get("oco_client_id") or "rsi-oco-" + uuid.uuid4().hex[:24]
+        attempt = int(pos.get("oco_attempts", 0)) + 1
+        pos["oco_attempts"] = attempt
+        cid = "rsi-oco-" + uuid.uuid4().hex[:20]
         pos["oco_client_id"] = cid
         pos["oco_pending"] = True
         pos["reconciliation_required"] = True
@@ -520,7 +535,7 @@ class Bot:
             pos["oco_error"] = type(exc).__name__
             st["reconciliation_required"] = True
             st["status"] = "reconciliation"
-            self.event("ERROR", f"OCO {symbol} tidak dapat dipastikan ({type(exc).__name__}); rekonsiliasi manual")
+            self.event("ERROR", f"OCO {symbol} tidak dapat dipastikan ({type(exc).__name__}) attempt#{attempt}; rekonsiliasi manual")
             self.save()
             return False
         pos["oco"] = oco
@@ -639,9 +654,9 @@ class Bot:
         if not (r4 < self.cfg.max4 and r1 < self.cfg.max1):
             return
 
-        atr = atr_pct(closed(c1raw, TF_MS["1h"], now_ms))
-        tp_pct = round(min(self.cfg.tp_max, max(self.cfg.tp_min, (atr or 0) * self.cfg.tp_atr)), 2)
         price = self.price(symbol)
+        atr = atr_pct(closed(c1raw, TF_MS["1h"], now_ms), current_price=price)
+        tp_pct = round(min(self.cfg.tp_max, max(self.cfg.tp_min, (atr or 0) * self.cfg.tp_atr)), 2)
         quote_free = self.broker.quote_free()
         equity = quote_free
         for pair, state in self.state["symbols"].items():
