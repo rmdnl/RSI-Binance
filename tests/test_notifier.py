@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import pathlib
@@ -143,3 +144,102 @@ def test_new_state_rejects_mode_mismatch(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="tidak cocok dengan testnet"):
         BOT.new_state(cfg.state_file, cfg)
     assert BOT.state_mode(cfg) == "testnet"
+
+
+def _make_bot(tmp_path, monkeypatch, sent):
+    cfg = _cfg_for(tmp_path, monkeypatch, "true", "false")
+    state = BOT.new_state(cfg.state_file, cfg)
+
+    class Capture:
+        def send(self, text):
+            sent.append(text)
+
+    return BOT.Bot(cfg, None, BOT.PaperBroker(state, cfg.paper_fee), Capture(), state)
+
+
+def _failing_save():
+    def boom():
+        raise OSError("disk penuh")
+    return boom
+
+
+def test_repeated_save_failures_alert_once_per_streak(tmp_path, monkeypatch):
+    """save() yang gagal berulang memicu tepat satu alert Telegram, bukan spam dan bukan senyap."""
+    sent = []
+    bot = _make_bot(tmp_path, monkeypatch, sent)
+    monkeypatch.setattr(bot, "save", _failing_save())
+
+    for _ in range(BOT.SAVE_ALERT_AFTER - 1):
+        assert bot.persist("loop") is False
+    assert sent == [], "alert dikirim sebelum ambang kegagalan tercapai"
+
+    assert bot.persist("loop") is False
+    assert len(sent) == 1 and "gagal menyimpan state" in sent[0]
+    assert bot.persist("loop") is False
+    assert len(sent) == 1, "kegagalan berikutnya tidak boleh menambah alert"
+
+    monkeypatch.setattr(bot, "save", lambda: None)
+    assert bot.persist("loop") is True
+    assert bot.save_failures == 0
+    assert len(sent) == 1
+
+
+def test_shutdown_save_failure_alerts_and_does_not_crash(tmp_path, monkeypatch):
+    """Kegagalan save saat shutdown dilaporkan; proses tidak boleh mati dengan exception."""
+    sent = []
+    bot = _make_bot(tmp_path, monkeypatch, sent)
+    monkeypatch.setattr(bot, "save", _failing_save())
+    bot.running = False
+
+    bot.run()  # tidak boleh melempar
+
+    assert sent[0].startswith("Bot dimulai")
+    assert "Bot dihentikan" in sent
+    assert any("gagal menyimpan state" in text for text in sent), sent
+    assert bot.save_failures == 1
+
+
+def test_exit_alert_survives_save_failure(tmp_path, monkeypatch):
+    """Alert exit (TP/SL) tetap terkirim saat save() gagal: pesan operator tidak boleh tertelan."""
+    sent = []
+    bot = _make_bot(tmp_path, monkeypatch, sent)
+    sent.clear()
+    monkeypatch.setattr(bot, "save", _failing_save())
+
+    st = bot.state["symbols"]["BTC/USDT"]
+    st["status"] = "in_position"
+    st["position"] = {"qty": 1.0, "cost": 100.0}
+    bot.record_exit("BTC/USDT", st, "TP", {"qty": 1.0, "price": 110.0, "proceeds": 109.89}, 1_700_000_000.0)
+
+    assert any(text.startswith("TP BTC/USDT: exit 110") for text in sent), sent
+    assert bot.save_failures == 1
+    assert st["position"] is None
+
+
+def _top_call(stmt, attr: str) -> bool:
+    """True bila pernyataan ini tepat sebuah pemanggilan `self.<attr>()` di level atas fungsi."""
+    return (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+            and isinstance(stmt.value.func, ast.Attribute) and stmt.value.func.attr == attr)
+
+
+def test_source_has_no_raw_save_pending_before_notify():
+    """Guard struktur: save() mentah yang belum di-reset persist() di depan notify() menelan alert.
+
+    Hanya pernyataan level atas yang diperiksa: `persist()` sendiri memakai `save()` lalu
+    `notify()` di dalam penanganan exceptionnya, dan itu memang jalur aman yang dimaksud.
+    """
+    tree = ast.parse((ROOT / "bot.py").read_text(encoding="utf-8"))
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        raw_save_pending = False
+        for stmt in node.body:
+            if _top_call(stmt, "persist"):
+                raw_save_pending = False  # penyimpanan aman menggantikan save() mentah
+            elif _top_call(stmt, "save"):
+                raw_save_pending = True
+            if raw_save_pending and _top_call(stmt, "notify"):
+                offenders.append(node.name)
+                break
+    assert offenders == [], f"pakai persist() sebelum notify(): {offenders}"

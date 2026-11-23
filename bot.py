@@ -23,6 +23,9 @@ from filelock import FileLock
 log = logging.getLogger("bot")
 TF_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
 TERMINAL = {"closed", "canceled", "cancelled", "expired", "rejected"}
+# Jumlah kegagalan save() beruntun sebelum alert Telegram dikirim. Visibilitas saja:
+# bot tetap berjalan dengan state di memori, perilaku trading tidak diubah.
+SAVE_ALERT_AFTER = 3
 
 
 def env(name: str, default: str = "") -> str:
@@ -400,12 +403,37 @@ class Bot:
         self.last_portfolio_update = 0.0
         self.pause_until = 0.0
         self.rate_limit_events = 0
+        self.save_failures = 0
 
     def save(self):
         tmp = self.cfg.state_file + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.state, f, indent=2, allow_nan=False)
         os.replace(tmp, self.cfg.state_file)
+
+    def persist(self, context: str = "loop") -> bool:
+        """Simpan state; kirim satu alert Telegram bila gagal berulang.
+
+        Kegagalan `save()` berarti state di disk bisa basi (mis. posisi yang baru dibuka tidak
+        tercatat), jadi operator harus tahu tanpa perlu membaca `journalctl`. Bot tetap memakai
+        state di memori sehingga perilaku trading tidak berubah, dan alert dibatasi satu per
+        rentetan kegagalan agar tidak membanjiri Telegram. Saat shutdown tidak ada kesempatan
+        mengulang, jadi kegagalan langsung dilaporkan.
+        """
+        try:
+            self.save()
+        except Exception as exc:
+            self.save_failures += 1
+            log.exception("Gagal menyimpan state (%s)", context)
+            if self.save_failures == SAVE_ALERT_AFTER or context == "shutdown":
+                self.notify(
+                    f"PERINGATAN {mode_label(self.cfg)}: gagal menyimpan state "
+                    f"{self.save_failures}x berturut-turut ({type(exc).__name__}: {str(exc)[:150]}). "
+                    "State di disk bisa basi; periksa ruang disk dan izin tulis state.json."
+                )
+            return False
+        self.save_failures = 0
+        return True
 
     def event(self, level: str, message: str):
         clean = str(message)[:500]
@@ -601,7 +629,7 @@ class Bot:
         trades = self.state.setdefault("realized_trades", [])
         trades.append({"time": now, "symbol": symbol, "qty": sold, "cost": cost_part, "proceeds": res["proceeds"], "pnl": pnl, "pnl_pct": pct})
         del trades[:-500]
-        self.save()
+        self.persist("exit")
         self.notify(f"{reason} {symbol}: exit {res['price']:g}; PnL {pnl:+.2f} {self.cfg.quote} ({pct:+.2f}%)")
 
     def exit_market(self, symbol: str, st: dict, reason: str, price: float, now: float):
@@ -615,13 +643,13 @@ class Bot:
             st["reconciliation_required"] = True
             st["status"] = "reconciliation"
             self.event("ERROR", f"Sell {symbol} ambiguous ({type(exc).__name__}); rekonsiliasi manual")
-            self.save()
+            self.persist("sell-ambiguous")
             raise
         if not result:
             st["pending_order"] = None
             st["reconciliation_required"] = True
             st["status"] = "reconciliation"
-            self.save()
+            self.persist("sell")
             self.event("ERROR", f"{symbol}: sell tidak terkirim/qty di bawah minimum")
             return
         st["pending_order"] = None
@@ -632,7 +660,7 @@ class Bot:
             pos["qty"] = remaining
             pos["cost"] = float(pos["cost"]) * remaining / old_qty
             pos["oco"] = None
-            self.save()
+            self.persist("sell-partial")
             self.event("WARNING", f"{symbol}: sell parsial; sisa {remaining:g}")
             return
         self.record_exit(symbol, st, reason, result, now)
@@ -757,7 +785,7 @@ class Bot:
             st["reconciliation_required"] = True
             st["status"] = "reconciliation"
             self.event("ERROR", f"Buy {symbol} ambiguous ({type(exc).__name__}); rekonsiliasi manual")
-            self.save()
+            self.persist("buy-ambiguous")
             raise
         pos = {"qty": result["qty"], "entry": result["price"], "cost": result["cost"],
                "sl": result["price"] * (1 - self.cfg.sl_pct / 100),
@@ -768,7 +796,7 @@ class Bot:
         st["entries"].append(now)
         tag = "" if state_mode(self.cfg) == "live" else f" [{mode_label(self.cfg)}]"
         diag["reason"] = "BUY berhasil dibuka" + tag
-        self.save()
+        self.persist("buy")
         if not self.cfg.dry_run and self.cfg.use_oco:
             self.arm_oco(symbol, st, pos)
         self.notify(f"BUY {symbol}{tag} @ {result['price']:g}; TP {pos['tp']:g}, SL {pos['sl']:g}")
@@ -889,15 +917,12 @@ class Bot:
                     self.update_portfolio()
                 except Exception as exc:
                     self.event("ERROR", f"Portfolio snapshot gagal: {type(exc).__name__}: {str(exc)[:200]}")
-            try:
-                self.save()
-            except Exception:
-                log.exception("Gagal menyimpan state")
+            self.persist("loop")
             time.sleep(self.cfg.loop_seconds)
         # Notifikasi dulu, baru simpan: notify() mencatat event "Bot dihentikan" ke state,
         # jadi save() harus berjalan setelahnya atau event stop hilang saat proses keluar.
         self.notify("Bot dihentikan")
-        self.save()
+        self.persist("shutdown")
 
 
 def state_mode(cfg: Config) -> str:

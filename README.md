@@ -296,7 +296,7 @@ Notifikasi hanya aktif jika token dan chat ID sama-sama tersedia. Jika salah sat
 
 Notifikasi startup menyebut mode yang benar-benar aktif — `Bot dimulai (DRY RUN)`, `Bot dimulai (TESTNET)`, atau `Bot dimulai (LIVE)` — dan notifikasi `BUY` diberi penanda `[DRY RUN]` atau `[TESTNET]`.
 
-Semua kegagalan yang terjadi sebelum loop utama berjalan juga dikirim ke Telegram, bukan hanya tercatat di log: gagal menyiapkan exchange, state yang perlu rekonsiliasi manual, saldo gagal dibaca, rekonsiliasi startup gagal, dan proses lain yang masih memegang lock. Kegagalan pengiriman Telegram sendiri dicatat di log beserta status HTTP dan badan respons, misalnya `Telegram gagal: HTTP 401 {"description":"Unauthorized"}`.
+Semua kegagalan yang terjadi sebelum loop utama berjalan juga dikirim ke Telegram, bukan hanya tercatat di log: gagal menyiapkan exchange, state yang perlu rekonsiliasi manual, saldo gagal dibaca, rekonsiliasi startup gagal, dan proses lain yang masih memegang lock. Kegagalan penyimpanan state di loop utama juga dilaporkan (lihat bagian *State, restart, dan rekonsiliasi*). Kegagalan pengiriman Telegram sendiri dicatat di log beserta status HTTP dan badan respons, misalnya `Telegram gagal: HTTP 401 {"description":"Unauthorized"}`.
 
 Untuk memastikan jalur notifikasi berfungsi tanpa menjalankan bot:
 
@@ -619,6 +619,10 @@ Bot menyimpan state secara atomik menggunakan file sementara dan penggantian fil
 
 Saat berhenti dengan benar (`SIGINT`/`SIGTERM`), bot mengirim notifikasi `Bot dihentikan` lebih dulu lalu menyimpan state, sehingga event stop tercatat di event log dan terlihat di dashboard. Urutan ini penting: bila state disimpan sebelum notifikasi stop, event tersebut hanya hidup di memori dan hilang saat proses keluar. Karena `loop_seconds` default 10 detik, proses bisa butuh hingga satu interval loop untuk benar-benar berhenti; `TimeoutStopSec` pada unit systemd harus lebih besar dari nilai itu.
 
+Penyimpanan state di loop utama dilakukan lewat `persist()`, yang menghitung kegagalan `save()` berturut-turut dan mengirim satu alert Telegram saat mencapai ambang (`SAVE_ALERT_AFTER = 3`), lalu tidak menambah alert sampai penyimpanan berhasil kembali. Kegagalan saat shutdown selalu dilaporkan karena tidak ada kesempatan mengulang. Alert ini murni visibilitas: bot tetap memakai state di memori, jadi perilaku trading tidak berubah — tanpa alert, state di disk bisa basi tanpa ada indikasi di Telegram.
+
+`persist()` juga dipakai di jalur transisi yang menggerbangi pesan operator: penutupan posisi (`record_exit` → alert TP/SL), pembukaan posisi yang berhasil (`scan_entry` → alert BUY), dan jalur rekonsiliasi sell/buy yang ambigu atau parsial. Dengan begitu satu kegagalan `save()` tidak menghilangkan alert atau catatan `ERROR`/`WARNING` yang menerangkannya. `save()` mentah tetap dipertahankan tepat sebelum order dikirim ke exchange, karena di titik itu gagal-cepat memang disengaja: bot tidak boleh lanjut menganggap order terkirim ketika penanda `pending_order` tidak tersimpan. Guard struktural di `tests/test_notifier.py` memastikan tidak ada `save()` mentah baru yang dipasang di depan `notify()`.
+
 ### Backup state
 
 Sebelum upgrade, perubahan konfigurasi besar, atau pemulihan manual, hentikan proses bot dengan benar dan backup file state serta log:
@@ -766,7 +770,7 @@ Jalankan dari direktori repository dengan virtual environment aktif:
 pytest -q
 ```
 
-Unit test yang tersedia (`tests/test_safety.py`, `tests/test_backtest.py`, dan `tests/test_notifier.py`; 29 kasus) mencakup:
+Unit test yang tersedia (`tests/test_safety.py`, `tests/test_backtest.py`, dan `tests/test_notifier.py`; 33 kasus) mencakup:
 
 - RSI pada data yang naik monotonis bernilai 100.
 - RSI pada data flat bernilai 100 (regresi sentinel lama `50`).
@@ -790,6 +794,10 @@ Unit test yang tersedia (`tests/test_safety.py`, `tests/test_backtest.py`, dan `
 - Backtest menghitung sinyal yang diblok lockout/max-entries pada kolom `ditahan`.
 - Notifier tidak mengirim apa pun bila token/chat ID kosong, dan mencatat status HTTP serta tipe exception saat pengiriman gagal.
 - `run()` memancarkan notifikasi start lalu stop meskipun loop langsung dihentikan, dan event stop ikut tersimpan ke `state.json` (regresi urutan `save()` sebelum `notify()` membuat event stop hilang).
+- Kegagalan `save()` beruntun memicu tepat satu alert Telegram saat mencapai ambang, tidak menambah alert pada kegagalan berikutnya, dan penghitungnya pulih setelah penyimpanan berhasil.
+- Kegagalan `save()` saat shutdown tetap dilaporkan dan tidak mematikan proses dengan exception.
+- Alert exit (TP/SL) tetap terkirim ketika `save()` gagal, sehingga penutupan posisi tidak pernah senyap.
+- Tidak ada `save()` mentah yang tersisa di depan `notify()` pada level atas fungsi mana pun di `bot.py` (guard struktur berbasis AST).
 - Hanya ada satu pembuatan `Notifier` di `main()` dan setiap jalur keluar sebelum `run()` mengirim peringatan.
 - Notifikasi startup menyebut mode sebenarnya (`DRY RUN`, `TESTNET`, atau `LIVE`), bukan hanya dry/live biner.
 - `new_state` menolak state dengan mode berbeda (`State mode dry tidak cocok dengan testnet`), sehingga state DRY RUN tidak pernah dipakai ulang oleh Testnet atau live.
