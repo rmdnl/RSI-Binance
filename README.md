@@ -905,6 +905,17 @@ Pastikan bot sudah dijalankan, dashboard menggunakan direktori kerja yang benar,
 
 Pastikan proses bot masih aktif dan snapshot portfolio sudah tersedia. Dashboard refresh setiap 5 detik, tetapi data sumber hanya berubah ketika bot memperbarui state.
 
+### Dashboard menjawab `not found` padahal service aktif
+
+Handler dashboard hanya melayani path persis `/` dan `/api/status`. Membuka URL dengan query string atau path tambahan, misalnya `http://127.0.0.1:8060/?v=1` atau `/index.html`, dijawab `404 not found` meski service berjalan normal. Buka `http://127.0.0.1:8060/` tanpa tambahan.
+
+Untuk memeriksa dari terminal, kedua path berikut harus menjawab `200`:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8060/
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8060/api/status
+```
+
 ### Bot menolak pergantian mode
 
 Periksa mode yang tercatat dalam state. Gunakan state terpisah untuk DRY RUN, Testnet, dan live. Jangan menghapus state live untuk melewati pemeriksaan ini.
