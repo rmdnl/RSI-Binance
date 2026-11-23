@@ -143,6 +143,8 @@ def test_scan_entry_records_diagnostics_and_rsi_history():
     assert diagnostic["candle_ts"] == candles[-1][0]
     assert diagnostic["oversold_seen"] is False
     assert diagnostic["trigger_cross"] is False
+    assert diagnostic["oversold"] == 25
+    assert diagnostic["trigger"] == 32
     assert "Belum ada RSI 15m" in diagnostic["reason"]
     assert symbol_state["rsi_history"]["15m"]
     assert symbol_state["rsi_history"]["1h"]

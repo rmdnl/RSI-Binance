@@ -42,7 +42,7 @@ Bot trading **Binance Spot multi-pair** berbasis konfirmasi RSI 15 menit dengan 
 - Pemantauan TP/SL oleh bot sebagai fallback ketika OCO tidak digunakan.
 - Penyimpanan state atomik untuk pemulihan setelah restart.
 - Estimasi realized PnL, unrealized PnL, dan portfolio.
-- Dashboard read-only dengan refresh otomatis setiap 5 detik dan diagnostik RSI per pair.
+- Dashboard read-only dengan refresh otomatis setiap 5 detik, diagnostik RSI per pair, dan alert ketika RSI 15m berada di bawah parameter oversold.
 - Log aplikasi dan notifikasi Telegram opsional.
 - Cache harga, throttling request, serta penanganan kondisi order yang hasilnya belum pasti.
 
@@ -513,6 +513,7 @@ Informasi yang ditampilkan:
 
 - Mode bot dan quote asset.
 - Diagnostik RSI per pair (RSI 15m/1h/4h, status, alasan gate entry) dan grafik interaktif tren RSI 15m/1h/4h selama 24 jam terakhir untuk pair yang dipilih. Warna garis menunjukkan timeframe (15m biru `#38bdf8`, 1h kuning `#fbbf24`, 4h ungu `#a78bfa`); bila lebih dari satu pair dipilih, pola garis putus-putus membedakan pair. Warna dan pola itu berasal dari konstanta `RSI_TF_COLORS` dan `RSI_PAIR_DASHES` di `dashboard.py`, jadi mengubahnya cukup di satu tempat. Histori memakai candle tertutup dan disimpan dalam state; RSI 1h/4h berasal dari agregasi candle 15m sehingga tidak menambah request API pada setiap evaluasi. Nilai agregasi memakai histori 15m yang tersedia, jadi dapat sedikit berbeda dari RSI 1h/4h exchange yang dipakai sebagai gate entry pada keputusan nyata.
+- **Alert oversold**: banner di bagian atas halaman berisi pair yang RSI 15m terkini berada di bawah parameter `RSI_OVERSOLD`, terurut dari yang paling oversold, dan baris pair terkait ditandai pada tabel diagnostik. Ambang diambil dari `diagnostics.oversold` yang dilaporkan bot di state, sehingga alert memakai parameter yang sama dengan gate entry; bila state belum memuatnya (state lama sebelum fitur ini), dashboard memakai default `25` atau `DASHBOARD_RSI_OVERSOLD` dan menandai sumbernya di banner. Perbandingan bersifat ketat: RSI tepat sama dengan ambang belum memicu alert. Alert hanya pemberitahuan — bot tetap membeli hanya setelah RSI 15m menembus ke atas `RSI_TRIGGER`.
 - Equity estimasi beserta label valuasi (portofolio kertas pada dry run, mark-to-market pada live).
 - Unrealized PnL dan realized PnL.
 - Daftar posisi bot, kuantitas, entry, mark price, nilai, TP, dan SL.
@@ -531,13 +532,14 @@ Dashboard menggunakan environment variable berikut:
 | `DASHBOARD_HOST` | `127.0.0.1` | Alamat bind dashboard |
 | `DASHBOARD_PORT` | `8060` | Port dashboard |
 | `STATE_FILE` | `state.json` | File state yang dibaca |
+| `DASHBOARD_RSI_OVERSOLD` | `25` | Ambang oversold cadangan untuk alert, dipakai hanya bila state belum memuat `diagnostics.oversold` |
 
 Dashboard tidak memuat file `.env` secara otomatis. Jika ingin mengubah konfigurasi dashboard, berikan environment variable pada proses saat dijalankan.
 
 Contoh Linux:
 
 ```bash
-DASHBOARD_HOST=127.0.0.1 DASHBOARD_PORT=8060 STATE_FILE=state.json python dashboard.py
+DASHBOARD_HOST=127.0.0.1 DASHBOARD_PORT=8060 STATE_FILE=state.json DASHBOARD_RSI_OVERSOLD=25 python dashboard.py
 ```
 
 Pastikan dashboard dan bot menggunakan file `STATE_FILE` yang sama dan dijalankan dari direktori kerja yang sesuai.
@@ -815,7 +817,7 @@ Jalankan dari direktori repository dengan virtual environment aktif:
 pytest -q
 ```
 
-Unit test yang tersedia (`tests/test_safety.py`, `tests/test_backtest.py`, dan `tests/test_notifier.py`; 33 kasus) mencakup:
+Unit test yang tersedia (`tests/test_safety.py` 16 kasus, `tests/test_backtest.py` 4 kasus, `tests/test_notifier.py` 13 kasus, `tests/test_dashboard.py` 15 kasus; total 48 kasus) mencakup:
 
 - RSI pada data yang naik monotonis bernilai 100.
 - RSI pada data flat bernilai 100 (regresi sentinel lama `50`).
@@ -828,7 +830,7 @@ Unit test yang tersedia (`tests/test_safety.py`, `tests/test_backtest.py`, dan `
 - `Config.from_env` menolak nilai integer non-bulat.
 - `update_rsi_history` membuang sampel di luar window 24 jam namun tetap menyimpan sampel lama yang masih di dalam window.
 - `aggregate_candles` menggabungkan candle 15m menjadi 1h/4h dengan OHLCV yang benar.
-- `scan_entry` menulis `diagnostics` dan `rsi_history` (15m/1h/4h) saat pair belum memenuhi syarat entry.
+- `scan_entry` menulis `diagnostics` dan `rsi_history` (15m/1h/4h) saat pair belum memenuhi syarat entry, termasuk parameter efektif `oversold` dan `trigger` yang dipakai dashboard untuk menghitung alert.
 - `update_portfolio` menulis snapshot dashboard lengkap pada mode dry run (equity, unrealized/realized PnL, posisi, saldo).
 - Nilai default `Config.from_env` sama dengan nilai di `env.example`.
 - `reconcile_startup` pada mode dry run membersihkan pending order yang tertinggal.
@@ -846,6 +848,9 @@ Unit test yang tersedia (`tests/test_safety.py`, `tests/test_backtest.py`, dan `
 - Hanya ada satu pembuatan `Notifier` di `main()` dan setiap jalur keluar sebelum `run()` mengirim peringatan.
 - Notifikasi startup menyebut mode sebenarnya (`DRY RUN`, `TESTNET`, atau `LIVE`), bukan hanya dry/live biner.
 - `new_state` menolak state dengan mode berbeda (`State mode dry tidak cocok dengan testnet`), sehingga state DRY RUN tidak pernah dipakai ulang oleh Testnet atau live.
+- Setiap timeframe grafik RSI memakai warna berbeda dan tiap pair memakai pola garis berbeda, serta setiap `Line` menerima `stroke` eksplisit (regresi: prop yang tidak dikirim membuat Recharts memakai satu warna default untuk semua garis).
+- Alert oversold dihitung dari ambang yang dilaporkan bot (`diagnostics.oversold`), memakai perbandingan ketat `<` (RSI sama dengan ambang belum memicu alert), mengabaikan RSI kosong/bukan angka, terurut dari yang paling oversold, dan jatuh ke default bila state belum memuat parameter.
+- `status_payload` menyertakan `alerts`, `oversold`, dan `oversold_source`, serta tetap aman untuk state kosong.
 
 Unit test tidak mengirim order dan tidak membuktikan profitabilitas atau keamanan seluruh skenario live.
 
@@ -905,6 +910,14 @@ Pastikan bot sudah dijalankan, dashboard menggunakan direktori kerja yang benar,
 
 Pastikan proses bot masih aktif dan snapshot portfolio sudah tersedia. Dashboard refresh setiap 5 detik, tetapi data sumber hanya berubah ketika bot memperbarui state.
 
+### Alert oversold muncul tetapi bot tidak membeli
+
+Alert dashboard hanya menandai RSI 15m di bawah `RSI_OVERSOLD`. Entry bot masih memerlukan seluruh gate lain: RSI 15m harus menembus ke atas `RSI_TRIGGER`, nilai konteks RSI 1h/4h harus di bawah batasnya, serta lockout, batas entry per window, dan batas posisi terbuka harus terpenuhi. Pair tetap ditampilkan pada tabel diagnostik dengan alasan gate yang berlaku.
+
+### Nilai oversold pada alert bukan `RSI_OVERSOLD` di `.env`
+
+Banner menandai sumber ambang. Sumber `parameter bot` berarti nilai diambil dari `diagnostics.oversold` di state. Sumber `default dashboard` berarti state belum memuat parameter tersebut (misalnya state lama sebelum fitur ini, atau pair belum pernah dievaluasi setelah upgrade); jalankan bot minimal satu kali evaluasi candle 15m, atau set `DASHBOARD_RSI_OVERSOLD` pada proses dashboard agar nilai cadangan sesuai.
+
 ### Dashboard menjawab `not found` padahal service aktif
 
 Handler dashboard hanya melayani path persis `/` dan `/api/status`. Membuka URL dengan query string atau path tambahan, misalnya `http://127.0.0.1:8060/?v=1` atau `/index.html`, dijawab `404 not found` meski service berjalan normal. Buka `http://127.0.0.1:8060/` tanpa tambahan.
@@ -939,7 +952,8 @@ RSI-Binance/
 ├── tests/
 │   ├── test_safety.py   # Unit test keselamatan dan indikator
 │   ├── test_backtest.py # Unit test parser dan matematika backtest
-│   └── test_notifier.py # Unit test jalur notifikasi Telegram tanpa jaringan
+│   ├── test_notifier.py # Unit test jalur notifikasi Telegram tanpa jaringan
+│   └── test_dashboard.py # Unit test kontrak halaman dashboard (warna grafik dan alert oversold)
 └── README.md            # Dokumentasi proyek
 ```
 

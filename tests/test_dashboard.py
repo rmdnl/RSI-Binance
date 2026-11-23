@@ -33,3 +33,112 @@ def test_every_rsi_line_gets_explicit_stroke():
     assert "DASHES[i%DASHES.length]" in dashboard.PAGE
     assert re.search(r"create\(R\.Line,\{[^}]*stroke:line\.stroke", dashboard.PAGE)
     assert re.search(r"create\(R\.Line,\{[^}]*strokeDasharray:line\.dash", dashboard.PAGE)
+
+
+def _diag(rsi_15m, oversold=25.0, trigger=32.0, **extra):
+    row = {"rsi_15m": rsi_15m, "candle_ts": 1_800_000_000_000, "evaluated_at": 1_800_000_100.0,
+           "oversold": oversold, "trigger": trigger, "oversold_seen": False}
+    row.update(extra)
+    return row
+
+
+def _state(symbols):
+    return {"bot_mode": "testnet", "symbols": symbols}
+
+
+def test_alert_flags_symbol_below_oversold():
+    state = _state({"BTC/USDT": {"diagnostics": _diag(21.4)}})
+    alerts = dashboard.rsi_oversold_alerts(state)
+    assert [a["symbol"] for a in alerts] == ["BTC/USDT"]
+    assert alerts[0]["rsi_15m"] == 21.4
+    assert alerts[0]["oversold"] == 25.0
+    assert alerts[0]["source"] == "state"
+    assert alerts[0]["candle_ts"] == 1_800_000_000_000
+
+
+def test_alert_uses_strict_below_comparison():
+    state = _state({
+        "BTC/USDT": {"diagnostics": _diag(25.0)},
+        "ETH/USDT": {"diagnostics": _diag(25.01)},
+        "SOL/USDT": {"diagnostics": _diag(24.99)},
+    })
+    assert [a["symbol"] for a in dashboard.rsi_oversold_alerts(state)] == ["SOL/USDT"]
+
+
+def test_alert_ignores_missing_and_non_numeric_rsi():
+    state = _state({
+        "BTC/USDT": {"diagnostics": _diag(None)},
+        "ETH/USDT": {"diagnostics": _diag("21")},
+        "SOL/USDT": {"diagnostics": _diag(True)},
+        "NEAR/USDT": {"diagnostics": _diag(float("nan"))},
+        "ADA/USDT": {"diagnostics": {}},
+        "XRP/USDT": {},
+    })
+    assert dashboard.rsi_oversold_alerts(state) == []
+
+
+def test_alert_sorted_by_rsi_ascending():
+    state = _state({
+        "BTC/USDT": {"diagnostics": _diag(22.0)},
+        "ETH/USDT": {"diagnostics": _diag(11.5)},
+        "SOL/USDT": {"diagnostics": _diag(18.3)},
+    })
+    assert [a["symbol"] for a in dashboard.rsi_oversold_alerts(state)] == ["ETH/USDT", "SOL/USDT", "BTC/USDT"]
+
+
+def test_threshold_falls_back_when_state_lacks_parameter():
+    state = _state({"BTC/USDT": {"diagnostics": {"rsi_15m": 27.0}}})
+    assert dashboard.oversold_threshold(state) == (25.0, "default")
+    assert dashboard.rsi_oversold_alerts(state) == []
+
+
+def test_fallback_override_is_honored_when_state_lacks_parameter(monkeypatch):
+    monkeypatch.setattr(dashboard, "OVERSOLD_FALLBACK", 30.0)
+    state = _state({"BTC/USDT": {"diagnostics": {"rsi_15m": 27.0}}})
+    alerts = dashboard.rsi_oversold_alerts(state)
+    assert alerts[0]["rsi_15m"] == 27.0
+    assert alerts[0]["oversold"] == 30.0
+    assert alerts[0]["source"] == "default"
+
+
+def test_bot_parameter_wins_over_fallback(monkeypatch):
+    monkeypatch.setattr(dashboard, "OVERSOLD_FALLBACK", 10.0)
+    state = _state({"BTC/USDT": {"diagnostics": _diag(28.0, oversold=30.0)}})
+    alerts = dashboard.rsi_oversold_alerts(state)
+    assert alerts[0]["oversold"] == 30.0
+    assert alerts[0]["source"] == "state"
+
+
+def test_invalid_oversold_parameter_falls_back_to_default():
+    state = _state({"BTC/USDT": {"diagnostics": {"rsi_15m": 20.0, "oversold": 250.0}}})
+    assert dashboard.oversold_threshold(state) == (25.0, "default")
+    assert dashboard.rsi_oversold_alerts(state)[0]["oversold"] == 25.0
+
+
+def test_status_payload_exposes_alert_contract():
+    state = _state({"BTC/USDT": {"status": "idle", "diagnostics": _diag(18.0)}})
+    payload = dashboard.status_payload(state)
+    assert payload["mode"] == "testnet"
+    assert payload["oversold"] == 25.0
+    assert payload["oversold_source"] == "state"
+    assert [a["symbol"] for a in payload["alerts"]] == ["BTC/USDT"]
+    assert payload["symbols"][0]["symbol"] == "BTC/USDT"
+
+
+def test_status_payload_tolerates_empty_state():
+    payload = dashboard.status_payload({})
+    assert payload["alerts"] == []
+    assert payload["oversold"] == dashboard.OVERSOLD_FALLBACK
+    assert payload["oversold_source"] == "default"
+    assert payload["symbols"] == []
+
+
+def test_page_renders_alert_banner_and_uses_state_threshold():
+    assert "alert-card" in dashboard.PAGE
+    assert "const alerts=d.alerts||[]" in dashboard.PAGE
+    assert "alertSet.has(x.symbol)" in dashboard.PAGE
+    assert "d.oversold==null" in dashboard.PAGE, "ambang grafik harus ikut nilai dari state"
+    assert "__OVERSOLD_FALLBACK__" not in dashboard.PAGE
+    assert f"OVERSOLD_FALLBACK={json.dumps(dashboard.OVERSOLD_FALLBACK)}" in dashboard.PAGE
+    assert re.search(r"create\(R\.ReferenceLine,\{[^}]*y:ov", dashboard.PAGE), "garis oversold harus memakai ambang"
+    assert "y:25," not in dashboard.PAGE, "ambang tidak boleh hardcoded"

@@ -701,6 +701,9 @@ class Bot:
         r4_chart = rsi_series([c[4] for c in c4_closed], self.cfg.period)
         diag = {"evaluated_at": now, "candle_ts": candles[-1][0],
                 "rsi_15m_previous": prev, "rsi_15m": last,
+                # Parameter efektif ikut disimpan agar dashboard bisa menghitung alert
+                # oversold dari sumber yang sama dengan gate entry bot.
+                "oversold": self.cfg.oversold, "trigger": self.cfg.trigger,
                 "rsi_1h": r1_chart[-1] if r1_chart and r1_chart[-1] is not None else None,
                 "rsi_4h": r4_chart[-1] if r4_chart and r4_chart[-1] is not None else None,
                 "oversold_seen": False, "trigger_cross": False,
