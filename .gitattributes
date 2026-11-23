@@ -1,0 +1,4 @@
+# Unit systemd harus berakhiran LF. Git di Windows (core.autocrlf=true) dapat
+# mengubahnya menjadi CRLF saat checkout, sehingga file hasil salin ke VPS
+# mengandung carriage return.
+*.service text eol=lf
