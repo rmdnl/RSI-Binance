@@ -2,6 +2,10 @@
 .env
 *.env
 !env.example
+# Backup .env (berisi kredensial) tidak boleh pernah masuk repo
+.env.*
+*.env.*
+.env.bak*
 
 # State runtime dan artefak bot
 state.json*
