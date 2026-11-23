@@ -99,7 +99,7 @@ class Config:
         cfg = cls(
             env("BINANCE_API_KEY"), env("BINANCE_API_SECRET"), boolean("BINANCE_TESTNET", False), boolean("DRY_RUN", True),
             env("QUOTE_ASSET", "USDT").upper(), symbols,
-            finite_int("RSI_PERIOD", 14, 2, 200), finite_float("RSI_OVERSOLD", 30, 0, 100),
+            finite_int("RSI_PERIOD", 14, 2, 200), finite_float("RSI_OVERSOLD", 25, 0, 100),
             finite_float("RSI_TRIGGER", 32, 0, 100), finite_float("RSI_4H_MAX", 35, 0, 100),
             finite_float("RSI_1H_MAX", 35, 0, 100), finite_int("ARM_LOOKBACK", 12, 1, 500),
             finite_float("REARM_LEVEL", 50, 0, 100), boolean("CONTEXT_USE_CLOSED", False),
@@ -155,6 +155,26 @@ def closed(candles: list[list], tf_ms: int, now_ms: int) -> list[list]:
     return [c for c in candles if int(c[0]) + tf_ms <= now_ms]
 
 
+def aggregate_candles(candles: list[list], tf_ms: int) -> list[list]:
+    """Gabungkan candle (mis. 15m) menjadi timeframe lebih besar yang selaras epoch.
+
+    Bucket terakhir yang belum penuh ikut disertakan; pemanggil menyaring candle
+    yang belum tertutup dengan `closed()` sehingga tidak ada data parsial terpakai.
+    """
+    out: list[list] = []
+    for candle in candles:
+        bucket = int(candle[0]) // tf_ms * tf_ms
+        if out and out[-1][0] == bucket:
+            row = out[-1]
+            row[2] = max(row[2], float(candle[2]))
+            row[3] = min(row[3], float(candle[3]))
+            row[4] = float(candle[4])
+            row[5] = float(row[5]) + float(candle[5])
+        else:
+            out.append([bucket, float(candle[1]), float(candle[2]), float(candle[3]), float(candle[4]), float(candle[5])])
+    return out
+
+
 def atr_pct(candles: list[list], period: int = 14, current_price: Optional[float] = None) -> Optional[float]:
     if len(candles) < period + 1:
         return None
@@ -172,7 +192,7 @@ def update_rsi_history(history: dict, timeframe: str, candles: list[list], perio
     rows = {int(row["timestamp"]): float(row["value"])
             for row in history.get(timeframe, [])
             if row.get("timestamp") is not None and row.get("value") is not None
-            and int(row["timestamp"] >= cutoff) >= cutoff}
+            and int(row["timestamp"]) >= cutoff}
     values = rsi_series([c[4] for c in candles], period)
     for candle, value in zip(candles, values):
         ts = int(candle[0])
@@ -410,8 +430,9 @@ class Bot:
         return value
 
     def reconcile_startup(self):
-        """Conservative live-only startup reconciliation. Never guesses on unknown OCO state."""
+        """Conservative startup reconciliation. Never guesses on unknown OCO state."""
         if self.cfg.dry_run:
+            self.reconcile_dry_run()
             return
         for symbol, st in self.state["symbols"].items():
             pos = st.get("position")
@@ -449,6 +470,18 @@ class Bot:
                 st["status"] = "reconciliation"
                 self.event("ERROR", f"{symbol}: saldo/startup reconciliation gagal: {type(exc).__name__}")
         self.save()
+
+    def reconcile_dry_run(self):
+        """Dry run tidak pernah membuat order exchange, jadi pending order yang tersisa pasti stale
+        (mis. proses terbunuh setelah `save()` sebelum order dicatat selesai) dan aman dibersihkan."""
+        changed = False
+        for symbol, st in self.state["symbols"].items():
+            if st.get("pending_order"):
+                st["pending_order"] = None
+                changed = True
+                self.event("WARNING", f"{symbol}: pending order dry run tertinggal dibersihkan saat startup")
+        if changed:
+            self.save()
 
     def process(self, symbol: str):
         st = self.state["symbols"][symbol]
@@ -499,13 +532,15 @@ class Bot:
                 old_qty = float(pos["qty"])
                 sold = min(float(result["qty"]), old_qty)
                 if status == "partial" or sold < old_qty * (1 - 1e-8):
-                    remaining = max(0.0, old_qty - sold)
-                    pos["qty"] = remaining
-                    pos["cost"] = float(pos["cost"]) * remaining / old_qty if old_qty else 0.0
-                    pos["oco"] = None
-                    pos["oco_pending"] = False
-                    pos["reconciliation_required"] = False
-                    self.event("WARNING", f"{symbol}: OCO fill parsial {sold:g}; sisa {remaining:g}")
+                    # Fail-closed: leg OCO yang terisi sebagian dapat menyisakan kuantitas yang
+                    # masih aktif di exchange, jadi referensi OCO tidak dilepas otomatis.
+                    pos["oco_pending"] = True
+                    pos["reconciliation_required"] = True
+                    st["reconciliation_required"] = True
+                    st["status"] = "reconciliation"
+                    self.event("ERROR", f"{symbol}: OCO fill parsial {sold:g} dari {old_qty:g}; sisa "
+                                        f"{max(0.0, old_qty - sold):g} mungkin masih aktif di exchange — "
+                                        "rekonsiliasi manual sebelum pair dilanjutkan")
                     self.save()
                     return
                 self.record_exit(symbol, st, result["leg"], result, now)
@@ -616,7 +651,7 @@ class Bot:
         expected_open = now_ms // TF_MS["15m"] * TF_MS["15m"] - TF_MS["15m"]
         if st["last_eval_ts"] >= expected_open:
             return
-        candles = closed(self.ex.fetch_ohlcv(symbol, "15m", limit=300), TF_MS["15m"], now_ms)
+        candles = closed(self.ex.fetch_ohlcv(symbol, "15m", limit=500), TF_MS["15m"], now_ms)
         if len(candles) < self.cfg.period + self.cfg.arm + 2:
             return
         if candles[-1][0] <= st["last_eval_ts"]:
@@ -624,7 +659,31 @@ class Bot:
         st["last_eval_ts"] = candles[-1][0]
         values = rsi_series([c[4] for c in candles], self.cfg.period)
         prev, last = values[-2], values[-1]
+
+        # Histori + diagnostik dashboard. 1h/4h diagregasi dari candle 15m yang sudah
+        # tertutup, jadi tidak menambah request API pada setiap evaluasi.
+        history = st.setdefault("rsi_history", {})
+        update_rsi_history(history, "15m", candles, self.cfg.period, now_ms)
+        c1_closed = closed(aggregate_candles(candles, TF_MS["1h"]), TF_MS["1h"], now_ms)
+        c4_closed = closed(aggregate_candles(candles, TF_MS["4h"]), TF_MS["4h"], now_ms)
+        update_rsi_history(history, "1h", c1_closed, self.cfg.period, now_ms)
+        update_rsi_history(history, "4h", c4_closed, self.cfg.period, now_ms)
+        r1_chart = rsi_series([c[4] for c in c1_closed], self.cfg.period)
+        r4_chart = rsi_series([c[4] for c in c4_closed], self.cfg.period)
+        diag = {"evaluated_at": now, "candle_ts": candles[-1][0],
+                "rsi_15m_previous": prev, "rsi_15m": last,
+                "rsi_1h": r1_chart[-1] if r1_chart and r1_chart[-1] is not None else None,
+                "rsi_4h": r4_chart[-1] if r4_chart and r4_chart[-1] is not None else None,
+                "oversold_seen": False, "trigger_cross": False,
+                "reason": "Menunggu evaluasi candle 15m"}
+        st["diagnostics"] = diag
+
+        def finish(reason: str):
+            diag["reason"] = reason
+            self.save()
+
         if prev is None or last is None:
+            finish("Data candle 15m belum cukup untuk menghitung RSI")
             return
 
         if st["need_reset"]:
@@ -635,23 +694,39 @@ class Bot:
         look = [value for value in values[-1 - self.cfg.arm:-1] if value is not None]
         crossed = prev <= self.cfg.trigger < last
         armed = bool(look) and min(look) < self.cfg.oversold
-        if st["need_reset"] or not (crossed and armed):
+        diag["oversold_seen"] = armed
+        diag["trigger_cross"] = crossed
+        if st["need_reset"]:
+            finish(f"Menunggu RSI 15m re-arm ke {self.cfg.rearm:g}")
+            return
+        if not armed:
+            finish(f"Belum ada RSI 15m di bawah oversold {self.cfg.oversold:g} pada lookback")
+            return
+        if not crossed:
+            finish(f"Belum ada crossing RSI 15m ke atas trigger {self.cfg.trigger:g}")
             return
         if now - st["last_trade_ts"] < self.cfg.lockout * 60:
+            finish("Menunggu re-entry lockout")
             return
 
         st["entries"] = [timestamp for timestamp in st["entries"] if now - timestamp < self.cfg.window_hours * 3600]
         if len(st["entries"]) >= self.cfg.max_entries:
+            finish("Batas entry per window sudah tercapai")
             return
         if sum(x["status"] == "in_position" for x in self.state["symbols"].values()) >= self.cfg.max_open:
+            finish("Batas posisi terbuka sudah tercapai")
             return
 
         c4raw = self.ex.fetch_ohlcv(symbol, "4h", limit=300)
         c1raw = self.ex.fetch_ohlcv(symbol, "1h", limit=300)
         r4, r1 = self.context_rsi(c4raw, c1raw, now_ms)
         if r4 is None or r1 is None:
+            finish("Data candle belum cukup untuk RSI konteks 1h/4h")
             return
+        diag["rsi_1h_context"] = r1
+        diag["rsi_4h_context"] = r4
         if not (r4 < self.cfg.max4 and r1 < self.cfg.max1):
+            finish(f"Filter konteks gagal: RSI 4h harus < {self.cfg.max4:g} dan RSI 1h harus < {self.cfg.max1:g}")
             return
 
         price = self.price(symbol)
@@ -664,11 +739,16 @@ class Bot:
                 equity += float(state["position"]["qty"]) * self.price(pair)
         cost = equity * self.cfg.position_pct / 100
         minimum = ((self.ex.market(symbol).get("limits") or {}).get("cost") or {}).get("min") or 0
-        if cost > quote_free or (minimum and cost < float(minimum)):
+        if cost > quote_free:
+            finish("Saldo quote tidak cukup untuk ukuran posisi")
+            return
+        if minimum and cost < float(minimum):
+            finish("Nilai order di bawah minimum exchange")
             return
 
         client_id = "rsi-b-" + uuid.uuid4().hex[:24]
         st["pending_order"] = {"type": "buy", "client_id": client_id, "cost": cost, "created_at": now}
+        diag["reason"] = "Kondisi entry lolos; order BUY sedang diproses"
         self.save()
         try:
             result = self.broker.buy(symbol, cost, price, client_id)
@@ -685,6 +765,7 @@ class Bot:
         st["pending_order"] = None
         st.update(status="in_position", position=pos, last_trade_ts=now)
         st["entries"].append(now)
+        diag["reason"] = "BUY berhasil dibuka" + (" (DRY RUN)" if self.cfg.dry_run else "")
         self.save()
         if not self.cfg.dry_run and self.cfg.use_oco:
             self.arm_oco(symbol, st, pos)
@@ -706,6 +787,89 @@ class Bot:
             self.event("ERROR", f"Binance protection/rate limit: pause {delay:g}s; no aggressive retry. {text}")
         else:
             self.event("ERROR", f"{symbol}: {text}")
+
+    def asset_value(self, asset: str, amount: float):
+        """Nilai aset non-quote dalam quote via ticker spot; None bila market/harga tidak tersedia."""
+        for market in getattr(self.ex, "markets", {}).values():
+            if (market.get("base") == asset and market.get("quote") == self.cfg.quote
+                    and market.get("spot") and market.get("active") is not False):
+                try:
+                    return amount * self.price(market["symbol"], 15)
+                except Exception:
+                    return None
+        return None
+
+    def update_portfolio(self):
+        """Snapshot portofolio read-only untuk dashboard. Tidak pernah mengirim order."""
+        now = time.time()
+        positions: list[dict] = []
+        assets: list[dict] = []
+        unpriced: list[str] = []
+
+        def position_row(symbol: str, pos: dict) -> dict:
+            qty = float(pos.get("qty") or 0.0)
+            try:
+                mark = self.price(symbol, 15)
+            except Exception:
+                mark = None
+            if mark is None:
+                unpriced.append(symbol.split("/")[0])
+                return {"symbol": symbol, "qty": qty, "entry": float(pos.get("entry") or 0.0),
+                        "mark": None, "value": None, "unrealized_pnl": None,
+                        "tp": pos.get("tp"), "sl": pos.get("sl")}
+            value = qty * mark
+            return {"symbol": symbol, "qty": qty, "entry": float(pos.get("entry") or 0.0),
+                    "mark": mark, "value": value, "unrealized_pnl": value - float(pos.get("cost") or 0.0),
+                    "tp": pos.get("tp"), "sl": pos.get("sl")}
+
+        if self.cfg.dry_run:
+            quote_free = float(self.state.get("paper_quote") or 0.0)
+            equity = quote_free
+            assets.append({"asset": self.cfg.quote, "total": quote_free, "free": quote_free,
+                           "used": 0.0, "value_quote": quote_free})
+            for symbol, st in self.state["symbols"].items():
+                pos = st.get("position")
+                if not pos:
+                    continue
+                row = position_row(symbol, pos)
+                positions.append(row)
+                if row["value"] is not None:
+                    equity += row["value"]
+                    assets.append({"asset": symbol.split("/")[0], "total": row["qty"], "free": row["qty"],
+                                   "used": 0.0, "value_quote": row["value"]})
+            valuation = "portofolio kertas (dry run)"
+        else:
+            balance = self.broker.fetch_balance()
+            totals = balance.get("total") or {}
+            frees = balance.get("free") or {}
+            useds = balance.get("used") or {}
+            equity = 0.0
+            for asset in sorted(totals):
+                amount = float(totals.get(asset) or 0.0)
+                if amount <= 0:
+                    continue
+                value = amount if asset == self.cfg.quote else self.asset_value(asset, amount)
+                if value is None:
+                    unpriced.append(asset)
+                else:
+                    equity += value
+                assets.append({"asset": asset, "total": amount, "free": float(frees.get(asset) or 0.0),
+                               "used": float(useds.get(asset) or 0.0), "value_quote": value})
+            for symbol, st in self.state["symbols"].items():
+                if st.get("position"):
+                    positions.append(position_row(symbol, st["position"]))
+            valuation = "mark-to-market akun" + ("; aset tanpa harga dikecualikan" if unpriced else "")
+
+        self.state["portfolio_snapshot"] = {
+            "updated_at": now, "mode": self.state.get("bot_mode", "unknown"), "quote": self.cfg.quote,
+            "valuation": valuation, "equity": equity,
+            "unrealized_pnl": sum(float(row["unrealized_pnl"]) for row in positions if row["unrealized_pnl"] is not None),
+            "realized_pnl": float(self.state.get("realized_pnl") or 0.0),
+            "realized_tracking_since": self.state.get("realized_tracking_since"),
+            "positions": positions, "assets": assets, "unpriced_assets": unpriced,
+            "rate_limit_events": self.rate_limit_events, "paused_until": self.pause_until,
+        }
+        self.last_portfolio_update = now
 
     def run(self):
         self.notify("Bot dimulai" + (" (DRY RUN)" if self.cfg.dry_run else " (LIVE)"))
@@ -746,6 +910,7 @@ def new_state(path: str, cfg: Config) -> dict:
     state.setdefault("symbols", {})
     state.setdefault("realized_pnl", 0.0)
     state.setdefault("realized_trades", [])
+    state.setdefault("realized_tracking_since", time.time())
     state.setdefault("events", [])
     for symbol in cfg.symbols:
         base = new_symbol_state()
@@ -774,7 +939,8 @@ def resolve_symbols(ex: Any, symbols: list[str], quote: str) -> list[str]:
 
 
 def main() -> int:
-    load_dotenv()
+    env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    load_dotenv(env_file if os.path.exists(env_file) else None)
     try:
         cfg = Config.from_env()
     except ValueError as exc:
@@ -801,6 +967,9 @@ def main() -> int:
 
     broker = PaperBroker(state, cfg.paper_fee) if cfg.dry_run else LiveBroker(ex, cfg.quote)
     notifier = Notifier(cfg.tg_token, cfg.tg_chat)
+    if not (cfg.tg_token and cfg.tg_chat):
+        log.warning("Telegram tidak dikonfigurasi (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID kosong); "
+                    "notifikasi start/stop/trade dinonaktifkan")
 
     try:
         with ProcessLock(cfg.state_file):
@@ -811,7 +980,7 @@ def main() -> int:
                 except Exception as exc:
                     log.error("Gagal membaca saldo: %s", type(exc).__name__)
                     return 2
-                bot.reconcile_startup()
+            bot.reconcile_startup()
             signal.signal(signal.SIGINT, lambda *_: setattr(bot, "running", False))
             signal.signal(signal.SIGTERM, lambda *_: setattr(bot, "running", False))
             bot.run()

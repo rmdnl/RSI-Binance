@@ -1,0 +1,19 @@
+# Rahasia dan konfigurasi lokal
+.env
+*.env
+!env.example
+
+# State runtime dan artefak bot
+state.json
+*.state.json
+*.log
+
+# Artefak Python dan pengujian
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Data hasil unduhan backtest
+*.csv

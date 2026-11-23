@@ -243,6 +243,7 @@ def simulate(c15: List[list], F: dict, start: int, max4: float, max1: float, a) 
             continue
 
         if t_close < cooldown_until:
+            blocked += 1
             continue
 
         prev = r15[i - 1]
@@ -303,7 +304,7 @@ def main(argv=None) -> int:
                    help="daftar RSI_4H_MAX/RSI_1H_MAX dipisah koma")
     p.add_argument("--closed", action="store_true", help="RSI 4H/1H hanya candle close (CONTEXT_USE_CLOSED=true)")
     p.add_argument("--period", type=int, default=14)
-    p.add_argument("--oversold", type=float, default=30)
+    p.add_argument("--oversold", type=float, default=25)
     p.add_argument("--trigger", type=float, default=32)
     p.add_argument("--lookback", type=int, default=12)
     p.add_argument("--rearm", type=float, default=50)
@@ -316,14 +317,14 @@ def main(argv=None) -> int:
     p.add_argument("--lockout", type=float, default=120, help="menit lockout re-entry")
     p.add_argument("--max-entries", type=int, default=2)
     p.add_argument("--window-hours", type=float, default=24)
-    p.add_argument("--fee", type=float, default=0.1, help="fee per sisi (%)")
-    p.add_argument("--slip", type=float, default=0.05, help="slippage SL market (%)")
+    p.add_argument("--fee", type=float, default=0.1, help="fee per sisi (%%)")
+    p.add_argument("--slip", type=float, default=0.05, help="slippage SL market (%%)")
     p.add_argument("--data-csv", help="pakai file CSV (ts_ms,o,h,l,c,v) alih-alih mengunduh")
     p.add_argument("--save-csv", help="simpan data unduhan ke CSV agar bisa diulang tanpa unduh")
     a = p.parse_args(argv)
 
     if a.data_csv:
-        c15 = clean(load_csv(a.data_csv))
+        c15 = clean(load_csv(a.data_csv), now_ms=int(time.time() * 1000))
     else:
         end_ms = int(time.time() * 1000)
         start_ms = end_ms - (a.days + a.warmup_days) * 86400 * 1000
@@ -340,6 +341,9 @@ def main(argv=None) -> int:
     test_start_s = last_s - a.days * 86400
     start = next((i for i, k in enumerate(c15) if k[0] // 1000 >= test_start_s), len(c15) - 1)
     start = max(start, a.lookback + a.period + 2)
+    if start < 200:
+        print(f"Peringatan: hanya {start} candle sebelum jendela uji untuk pemanasan RSI; "
+              f"nilai RSI awal bisa belum stabil (disarankan >= 200 candle, mis. --warmup-days 30).")
 
     print(f"\n{a.symbol} | uji {ts_str(c15[start][0] // 1000)} → {ts_str(last_s)} "
           f"({(last_s - c15[start][0] // 1000) / 86400:.0f} hari, {len(c15) - start} candle 15m) | "
@@ -365,9 +369,11 @@ def main(argv=None) -> int:
     print(f"\nKondisi terakhir {a.symbol}: RSI 15m {f4(F['r15'][i])} | 1H {f4(F['r1_live'][i])} | "
           f"4H {f4(F['r4_live'][i])}")
     print("\nKeterangan: cross15m = RSI 15m menembus trigger setelah <oversold (hanya dihitung saat bot tidak "
-          "memegang posisi/cooldown, seperti bot asli); lolos = konteks 4H/1H terpenuhi; ditahan = diblok "
-          "anti beli beruntun; ekuitas% = hasil kumulatif dengan ukuran posisi di atas.")
-    print("Catatan: SL/TP bersamaan dalam satu candle dihitung SL; hasil historis tidak menjamin ke depan.")
+          "memegang posisi/cooldown, seperti bot asli); lolos = konteks 4H/1H terpenuhi; ditahan = sinyal "
+          "yang lolos konteks tetapi diblok aturan anti beli beruntun (cooldown, lockout, batas entry per "
+          "jendela, atau reset RSI belum pulih); ekuitas% = hasil kumulatif dengan ukuran posisi di atas.")
+    print("Catatan: SL/TP bersamaan dalam satu candle dihitung SL; maxDD dihitung saat trade ditutup "
+          "(bukan intratrade); hasil historis tidak menjamin ke depan.")
     return 0
 
 

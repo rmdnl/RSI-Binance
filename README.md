@@ -95,6 +95,7 @@ Dependensi Python dipasang dari `requirements.txt`:
 - `ccxt`: koneksi exchange dan eksekusi order.
 - `requests`: request HTTP, termasuk kebutuhan notifikasi.
 - `python-dotenv`: membaca konfigurasi dari file `.env`.
+- `filelock`: penguncian lintas platform agar hanya satu proses bot per file state (menggantikan `fcntl` yang hanya tersedia di Unix).
 - `pytest`: menjalankan unit test.
 
 ## Instalasi di Linux atau VPS
@@ -224,7 +225,9 @@ pytest -q
 
 ## Konfigurasi environment
 
-Semua konfigurasi bot dibaca dari file `.env` di direktori kerja bot. Gunakan `env.example` sebagai template resmi dan sesuaikan nilainya sebelum menjalankan.
+Semua konfigurasi bot dibaca dari file `.env`. Bot memuat `.env` yang berada di direktori repository (satu direktori dengan `bot.py`) supaya konfigurasi tetap terbaca walau proses dijalankan dari direktori kerja lain, misalnya melalui systemd. Jika file tersebut tidak ada, bot memakai pencarian `.env` bawaan `python-dotenv` dari direktori kerja. Gunakan `env.example` sebagai template resmi dan sesuaikan nilainya sebelum menjalankan.
+
+Nilai di `env.example` sama dengan nilai default di kode. Jika sebuah variabel dihapus dari `.env`, bot memakai default tersebut, bukan nilai kosong.
 
 ### 1. Binance API dan mode
 
@@ -289,7 +292,7 @@ Untuk mengaktifkannya:
 4. Kirim pesan awal ke bot jika diperlukan agar bot dapat mengirim pesan ke chat tersebut.
 5. Isi kedua variabel di file `.env`.
 
-Notifikasi hanya aktif jika token dan chat ID sama-sama tersedia.
+Notifikasi hanya aktif jika token dan chat ID sama-sama tersedia. Jika salah satu variabel kosong, bot tetap berjalan tanpa notifikasi dan menulis warning `Telegram tidak dikonfigurasi` di log saat startup.
 
 ### 4. Parameter RSI
 
@@ -489,8 +492,8 @@ Dashboard melakukan refresh otomatis setiap **5 detik**.
 Informasi yang ditampilkan:
 
 - Mode bot dan quote asset.
-- Diagnostik RSI per pair dan grafik interaktif tren RSI 15m/1h/4h selama 24 jam terakhir untuk pair yang dipilih. Histori memakai candle tertutup dan disimpan dalam state.
-- Equity estimasi.
+- Diagnostik RSI per pair (RSI 15m/1h/4h, status, alasan gate entry) dan grafik interaktif tren RSI 15m/1h/4h selama 24 jam terakhir untuk pair yang dipilih. Histori memakai candle tertutup dan disimpan dalam state; RSI 1h/4h berasal dari agregasi candle 15m sehingga tidak menambah request API pada setiap evaluasi. Nilai agregasi memakai histori 15m yang tersedia, jadi dapat sedikit berbeda dari RSI 1h/4h exchange yang dipakai sebagai gate entry pada keputusan nyata.
+- Equity estimasi beserta label valuasi (portofolio kertas pada dry run, mark-to-market pada live).
 - Unrealized PnL dan realized PnL.
 - Daftar posisi bot, kuantitas, entry, mark price, nilai, TP, dan SL.
 - Saldo aset: total, free, used, dan estimasi nilai.
@@ -570,7 +573,7 @@ python backtest.py --symbol NEARUSDT --days 90 --data-csv nearusdt_15m.csv
 | `--combos` | Kombinasi batas RSI 4H/1H, format `30/30,35/40` |
 | `--closed` | Menggunakan konteks candle 1H/4H tertutup |
 | `--period` | Periode RSI |
-| `--oversold` | Ambang oversold |
+| `--oversold` | Ambang oversold (default `25`, sama dengan `RSI_OVERSOLD` di `env.example`) |
 | `--trigger` | Level trigger RSI 15m |
 | `--lookback` | Lookback candle untuk kondisi oversold |
 | `--rearm` | Level RSI untuk re-arm |
@@ -587,7 +590,9 @@ python backtest.py --symbol NEARUSDT --days 90 --data-csv nearusdt_15m.csv
 | `--data-csv` | Membaca candle dari CSV lokal |
 | `--save-csv` | Menyimpan data hasil unduhan ke CSV |
 
-Backtest bukan simulasi sempurna kondisi live. Entry diasumsikan pada close candle sinyal. Jika SL dan TP tersentuh dalam candle yang sama, SL dihitung lebih dahulu. Spread, market impact, latency, partial fill, downtime, dan seluruh kondisi kegagalan exchange tidak dimodelkan secara lengkap.
+Pada tabel hasil, kolom `ditahan` menghitung sinyal yang lolos konteks RSI 4H/1H tetapi diblok aturan anti beli beruntun (cooldown setelah SL, lockout re-entry, batas entry per jendela, atau reset RSI belum pulih). Backtest akan mencetak peringatan bila data sebelum jendela uji kurang dari 200 candle, karena RSI awal belum stabil.
+
+Backtest bukan simulasi sempurna kondisi live. Entry diasumsikan pada close candle sinyal. Jika SL dan TP tersentuh dalam candle yang sama, SL dihitung lebih dahulu. ATR dinormalisasi terhadap close candle 1H terakhir, sedangkan bot memakai harga terkini. Max drawdown dihitung pada saat trade ditutup, bukan intratrade, sehingga nilainya lebih kecil dari drawdown real-time. Spread, market impact, latency, partial fill, downtime, dan seluruh kondisi kegagalan exchange tidak dimodelkan secara lengkap.
 
 ## State, restart, dan rekonsiliasi
 
@@ -621,12 +626,17 @@ Periksa hal berikut langsung di Binance:
 
 Setelah kondisi exchange dan state cocok, lakukan rekonsiliasi secara hati-hati. Jangan menghapus pending intent hanya agar bot kembali trading.
 
+### OCO terisi sebagian
+
+Jika salah satu leg OCO hanya terisi sebagian, bot tidak mengurangi kuantitas posisi dan tidak melepas referensi OCO. Pair ditandai `reconciliation` dan berhenti diproses sampai kondisi exchange dicocokkan manual. Alasan: sisa kuantitas leg OCO dapat masih aktif di exchange, sehingga mengurangi posisi secara lokal berisiko menjual kuantitas yang sama dua kali.
+
 ### Saat bot restart atau berhenti
 
 - Posisi yang masih terbuka tidak otomatis dijual ketika bot berhenti.
 - OCO yang sudah diterima Binance dapat tetap aktif di exchange meskipun bot/VPS mati.
 - Posisi tanpa OCO tidak dipantau selama proses bot mati.
 - Selalu periksa posisi dan open order setelah restart, terutama jika proses sebelumnya berhenti ketika order sedang diproses.
+- Pada mode DRY RUN, pending order yang tertinggal dari proses yang berhenti mendadak dibersihkan otomatis saat startup, karena mode ini tidak pernah membuat order exchange.
 
 ## PnL dan portfolio
 
@@ -735,14 +745,28 @@ Jalankan dari direktori repository dengan virtual environment aktif:
 pytest -q
 ```
 
-Unit test yang tersedia mencakup:
+Unit test yang tersedia (`tests/test_safety.py` dan `tests/test_backtest.py`, 20 kasus) mencakup:
 
-- RSI pada data yang naik monotonis.
-- RSI pada data flat.
-- True Range ATR yang memperhitungkan previous close.
-- Validasi konfigurasi integer.
-- Penolakan nilai numerik non-finite.
-- Pencatatan diagnostik RSI saat kondisi oversold belum terpenuhi.
+- RSI pada data yang naik monotonis bernilai 100.
+- RSI pada data flat bernilai 100 (regresi sentinel lama `50`).
+- RSI saat seluruh pergerakan turun bernilai 0.
+- RSI mengembalikan `None` bila jumlah data kurang dari periode.
+- ATR% memakai `current_price` sebagai harga referensi.
+- ATR% mengembalikan `None` bila data tidak cukup.
+- `ProcessLock` mengunci lintas platform dan menolak acquire kedua.
+- `poll_oco` bersifat fail-closed (`unknown`) saat exchange error.
+- `Config.from_env` menolak nilai integer non-bulat.
+- `update_rsi_history` membuang sampel di luar window 24 jam namun tetap menyimpan sampel lama yang masih di dalam window.
+- `aggregate_candles` menggabungkan candle 15m menjadi 1h/4h dengan OHLCV yang benar.
+- `scan_entry` menulis `diagnostics` dan `rsi_history` (15m/1h/4h) saat pair belum memenuhi syarat entry.
+- `update_portfolio` menulis snapshot dashboard lengkap pada mode dry run (equity, unrealized/realized PnL, posisi, saldo).
+- Nilai default `Config.from_env` sama dengan nilai di `env.example`.
+- `reconcile_startup` pada mode dry run membersihkan pending order yang tertinggal.
+- OCO yang terisi sebagian bersifat fail-closed: kuantitas posisi tidak dikurangi dan pair menunggu rekonsiliasi manual.
+- CLI `backtest.py` dapat mem-parse argumennya sendiri (regresi format `%` pada teks `--help`).
+- Net return backtest pada jalur SL sama dengan rumus `(entry*(1-SL%)*(1-slip)/entry)*(1-fee)^2-1`.
+- Net return backtest pada jalur TP sama dengan rumus `(1+TP%)*(1-fee)^2-1`.
+- Backtest menghitung sinyal yang diblok lockout/max-entries pada kolom `ditahan`.
 
 Unit test tidak mengirim order dan tidak membuktikan profitabilitas atau keamanan seluruh skenario live.
 
@@ -762,7 +786,7 @@ pip install -r requirements.txt
 
 ### File `.env` tidak terbaca
 
-Pastikan file bernama tepat `.env`, berada di direktori kerja bot, dan bot dijalankan dari direktori repository. Periksa juga apakah variabel yang dibutuhkan sudah diisi.
+Pastikan file bernama tepat `.env` dan berada di direktori yang sama dengan `bot.py`; bot memuat `.env` dari direktori `bot.py`, bukan dari direktori kerja, sehingga tetap terbaca saat dijalankan sebagai service (mis. systemd). Periksa juga apakah variabel yang dibutuhkan sudah diisi.
 
 ### API key atau autentikasi gagal
 
@@ -798,7 +822,8 @@ RSI-Binance/
 ├── env.example          # Template konfigurasi bot
 ├── requirements.txt     # Dependensi Python
 ├── tests/
-│   └── test_safety.py   # Unit test keselamatan dan indikator
+│   ├── test_safety.py   # Unit test keselamatan dan indikator
+│   └── test_backtest.py # Unit test parser dan matematika backtest
 └── README.md            # Dokumentasi proyek
 ```
 
