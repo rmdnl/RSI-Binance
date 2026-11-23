@@ -1,0 +1,27 @@
+# Template unit systemd untuk bot RSI-Binance.
+# Salin ke /etc/systemd/system/ lalu sesuaikan User, Group, WorkingDirectory,
+# dan ExecStart bila repository tidak berada di /home/ubuntu/RSI-Binance.
+[Unit]
+Description=RSI Binance Spot Bot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/RSI-Binance
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/RSI-Binance/venv/bin/python /home/ubuntu/RSI-Binance/bot.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rsi-binance
+
+[Install]
+WantedBy=multi-user.target

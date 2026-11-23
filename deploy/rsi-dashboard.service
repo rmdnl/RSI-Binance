@@ -1,0 +1,33 @@
+# Template unit systemd untuk dashboard read-only RSI-Binance.
+# Salin ke /etc/systemd/system/ lalu sesuaikan User, Group, WorkingDirectory,
+# dan ExecStart bila repository tidak berada di /home/ubuntu/RSI-Binance.
+# Dashboard bind ke 127.0.0.1 dan tanpa autentikasi: akses dari luar lewat SSH tunnel.
+[Unit]
+Description=RSI Binance Read-Only Dashboard
+Documentation=https://github.com/rmdnl/RSI-Binance
+After=network-online.target rsi-binance.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/RSI-Binance
+Environment=PYTHONUNBUFFERED=1
+Environment=DASHBOARD_HOST=127.0.0.1
+Environment=DASHBOARD_PORT=8060
+Environment=STATE_FILE=/home/ubuntu/RSI-Binance/state.json
+ExecStart=/home/ubuntu/RSI-Binance/venv/bin/python /home/ubuntu/RSI-Binance/dashboard.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rsi-dashboard
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

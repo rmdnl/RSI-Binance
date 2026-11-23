@@ -20,6 +20,7 @@ Bot trading **Binance Spot multi-pair** berbasis konfirmasi RSI 15 menit dengan 
 - [PnL dan portfolio](#pnl-dan-portfolio)
 - [Keamanan dan batas API Binance](#keamanan-dan-batas-api-binance)
 - [Menjalankan di VPS](#menjalankan-di-vps)
+- [Menjalankan sebagai service systemd](#menjalankan-sebagai-service-systemd)
 - [Pengujian](#pengujian)
 - [Troubleshooting](#troubleshooting)
 - [Struktur repository](#struktur-repository)
@@ -636,6 +637,12 @@ Sesuaikan nama file jika `STATE_FILE` atau `LOG_FILE` diubah.
 
 Jangan mengedit state ketika bot sedang berjalan. Jangan menghapus state live sebagai cara untuk mengatasi error.
 
+### Mengubah daftar pair
+
+`SYMBOLS` dibaca saat startup. Simbol baru ditambahkan ke state, tetapi entri simbol yang dihapus dari `SYMBOLS` tidak dipangkas otomatis dan tetap tersimpan sebagai residu. Residu tidak discan, tidak direkonsiliasi (karena tidak punya posisi), dan tidak masuk snapshot portfolio, tetapi tetap ikut ditulis ke state dan masih tampil di dashboard.
+
+Membersihkannya: hentikan service, backup `state.json`, hapus entri pada `state["symbols"]`, lalu start kembali. Jangan mengedit state saat bot berjalan karena `save()` berikutnya akan menimpa perubahan itu.
+
 ### Pending order dan order ambiguous
 
 Jika respons order BUY, SELL, atau OCO tidak dapat dipastikan, bot menyimpan pending intent dan membekukan pair terkait. Jangan mengirim order pengganti secara manual sebelum memeriksa kondisi exchange.
@@ -760,7 +767,45 @@ Untuk melihat sesi tmux:
 tmux ls
 ```
 
-tmux menjaga proses tetap berjalan setelah sesi SSH terputus, tetapi tidak otomatis menjamin bot aktif kembali setelah reboot VPS. Untuk auto-start dan restart otomatis, siapkan service manager seperti systemd secara terpisah setelah konfigurasi dan perilaku bot sudah diuji. Pastikan hanya ada satu proses bot yang memakai state/account tersebut.
+tmux menjaga proses tetap berjalan setelah sesi SSH terputus, tetapi tidak otomatis menjamin bot aktif kembali setelah reboot VPS. Untuk auto-start dan restart otomatis, gunakan unit systemd pada bagian [Menjalankan sebagai service systemd](#menjalankan-sebagai-service-systemd). Pastikan hanya ada satu proses bot yang memakai state/account tersebut.
+
+## Menjalankan sebagai service systemd
+
+Unit contoh tersedia di `deploy/` dan identik dengan unit yang dipakai pada VPS yang sudah diuji.
+
+```bash
+sudo cp deploy/rsi-binance.service /etc/systemd/system/
+sudo cp deploy/rsi-dashboard.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now rsi-binance.service
+sudo systemctl enable --now rsi-dashboard.service
+```
+
+Sesuaikan `User`, `Group`, `WorkingDirectory`, dan `ExecStart` bila repository tidak berada di `/home/ubuntu/RSI-Binance`.
+
+Verifikasi:
+
+```bash
+systemctl status rsi-binance.service rsi-dashboard.service --no-pager
+sudo journalctl -u rsi-binance.service -n 20 --no-pager
+systemctl is-enabled rsi-binance.service rsi-dashboard.service   # harus "enabled" agar ikut saat boot
+systemctl show rsi-binance.service -p ActiveState -p SubState -p NRestarts
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8060/api/status
+```
+
+Ciri unit yang dipakai:
+
+- `TimeoutStopSec=60` pada bot, lebih besar dari `LOOP_SECONDS`, agar SIGTERM sempat menjalankan notifikasi `Bot dihentikan` dan penyimpanan state sebelum proses benar-benar berhenti.
+- `KillSignal=SIGTERM` (bukan SIGKILL) sehingga jalur shutdown sama dengan `Ctrl+C`.
+- `Restart=on-failure` pada bot: crash memicu restart, sedangkan penghentian normal (`systemctl stop`) tidak memulai ulang proses.
+- `Restart=always` pada dashboard karena dashboard hanya membaca state dan aman dijalankan ulang.
+- `StartLimitIntervalSec=300` bersama `StartLimitBurst=5` mencegah crash loop tanpa batas.
+- Tidak ada `EnvironmentFile`: bot memuat `.env` sendiri lewat `python-dotenv` dengan path absolut, sehingga unit tetap bekerja meski `WorkingDirectory` berbeda.
+- Dashboard bind ke `127.0.0.1` dan tidak menyediakan autentikasi; akses dari luar hanya lewat SSH tunnel (lihat [bagian dashboard](#5-akses-dashboard-vps-dari-komputer-lokal)).
+
+Jangan menjalankan `python bot.py` manual saat service sedang aktif: dua proses pada state dan akun yang sama dapat mengirim order ganda, dan `state.json.lock` akan menolak proses kedua.
+
+Opsional (hardening): tambahkan `NoNewPrivileges=true` dan `PrivateTmp=true` pada blok `[Service]` bot setelah diuji pada mesin Anda.
 
 ## Pengujian
 
@@ -877,6 +922,9 @@ RSI-Binance/
 ├── backtest.py          # Backtest historis strategi RSI
 ├── env.example          # Template konfigurasi bot
 ├── requirements.txt     # Dependensi Python
+├── deploy/
+│   ├── rsi-binance.service    # Template unit systemd bot
+│   └── rsi-dashboard.service  # Template unit systemd dashboard
 ├── tests/
 │   ├── test_safety.py   # Unit test keselamatan dan indikator
 │   ├── test_backtest.py # Unit test parser dan matematika backtest
