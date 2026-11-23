@@ -86,6 +86,11 @@ def test_run_emits_start_then_stop_notification(tmp_path, monkeypatch):
     assert sent == ["Bot dimulai (DRY RUN)", "Bot dihentikan"]
     assert (tmp_path / "state.json").exists()
 
+    # Event stop harus ikut tersimpan: kalau save() berjalan sebelum notify(), event
+    # "Bot dihentikan" hanya ada di memori dan hilang saat proses keluar.
+    saved = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    assert [event["message"] for event in saved["events"]] == ["Bot dimulai (DRY RUN)", "Bot dihentikan"]
+
 
 def test_main_has_single_notifier_and_alerts_before_run():
     """Semua jalur keluar sebelum run() harus mengirim peringatan Telegram."""

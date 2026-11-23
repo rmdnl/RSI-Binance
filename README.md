@@ -617,6 +617,8 @@ Backtest bukan simulasi sempurna kondisi live. Entry diasumsikan pada close cand
 
 Bot menyimpan state secara atomik menggunakan file sementara dan penggantian file. State mencakup mode bot, saldo paper, status pair, candle terakhir, cooldown, lockout, posisi, pending order, informasi OCO, PnL, snapshot portfolio, dan event log.
 
+Saat berhenti dengan benar (`SIGINT`/`SIGTERM`), bot mengirim notifikasi `Bot dihentikan` lebih dulu lalu menyimpan state, sehingga event stop tercatat di event log dan terlihat di dashboard. Urutan ini penting: bila state disimpan sebelum notifikasi stop, event tersebut hanya hidup di memori dan hilang saat proses keluar. Karena `loop_seconds` default 10 detik, proses bisa butuh hingga satu interval loop untuk benar-benar berhenti; `TimeoutStopSec` pada unit systemd harus lebih besar dari nilai itu.
+
 ### Backup state
 
 Sebelum upgrade, perubahan konfigurasi besar, atau pemulihan manual, hentikan proses bot dengan benar dan backup file state serta log:
@@ -787,7 +789,7 @@ Unit test yang tersedia (`tests/test_safety.py`, `tests/test_backtest.py`, dan `
 - Net return backtest pada jalur TP sama dengan rumus `(1+TP%)*(1-fee)^2-1`.
 - Backtest menghitung sinyal yang diblok lockout/max-entries pada kolom `ditahan`.
 - Notifier tidak mengirim apa pun bila token/chat ID kosong, dan mencatat status HTTP serta tipe exception saat pengiriman gagal.
-- `run()` memancarkan notifikasi start lalu stop meskipun loop langsung dihentikan.
+- `run()` memancarkan notifikasi start lalu stop meskipun loop langsung dihentikan, dan event stop ikut tersimpan ke `state.json` (regresi urutan `save()` sebelum `notify()` membuat event stop hilang).
 - Hanya ada satu pembuatan `Notifier` di `main()` dan setiap jalur keluar sebelum `run()` mengirim peringatan.
 - Notifikasi startup menyebut mode sebenarnya (`DRY RUN`, `TESTNET`, atau `LIVE`), bukan hanya dry/live biner.
 - `new_state` menolak state dengan mode berbeda (`State mode dry tidak cocok dengan testnet`), sehingga state DRY RUN tidak pernah dipakai ulang oleh Testnet atau live.

@@ -894,8 +894,10 @@ class Bot:
             except Exception:
                 log.exception("Gagal menyimpan state")
             time.sleep(self.cfg.loop_seconds)
-        self.save()
+        # Notifikasi dulu, baru simpan: notify() mencatat event "Bot dihentikan" ke state,
+        # jadi save() harus berjalan setelahnya atau event stop hilang saat proses keluar.
         self.notify("Bot dihentikan")
+        self.save()
 
 
 def state_mode(cfg: Config) -> str:
