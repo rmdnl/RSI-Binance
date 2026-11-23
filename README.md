@@ -512,7 +512,7 @@ Dashboard melakukan refresh otomatis setiap **5 detik**.
 Informasi yang ditampilkan:
 
 - Mode bot dan quote asset.
-- Diagnostik RSI per pair (RSI 15m/1h/4h, status, alasan gate entry) dan grafik interaktif tren RSI 15m/1h/4h selama 24 jam terakhir untuk pair yang dipilih. Histori memakai candle tertutup dan disimpan dalam state; RSI 1h/4h berasal dari agregasi candle 15m sehingga tidak menambah request API pada setiap evaluasi. Nilai agregasi memakai histori 15m yang tersedia, jadi dapat sedikit berbeda dari RSI 1h/4h exchange yang dipakai sebagai gate entry pada keputusan nyata.
+- Diagnostik RSI per pair (RSI 15m/1h/4h, status, alasan gate entry) dan grafik interaktif tren RSI 15m/1h/4h selama 24 jam terakhir untuk pair yang dipilih. Warna garis menunjukkan timeframe (15m biru `#38bdf8`, 1h kuning `#fbbf24`, 4h ungu `#a78bfa`); bila lebih dari satu pair dipilih, pola garis putus-putus membedakan pair. Warna dan pola itu berasal dari konstanta `RSI_TF_COLORS` dan `RSI_PAIR_DASHES` di `dashboard.py`, jadi mengubahnya cukup di satu tempat. Histori memakai candle tertutup dan disimpan dalam state; RSI 1h/4h berasal dari agregasi candle 15m sehingga tidak menambah request API pada setiap evaluasi. Nilai agregasi memakai histori 15m yang tersedia, jadi dapat sedikit berbeda dari RSI 1h/4h exchange yang dipakai sebagai gate entry pada keputusan nyata.
 - Equity estimasi beserta label valuasi (portofolio kertas pada dry run, mark-to-market pada live).
 - Unrealized PnL dan realized PnL.
 - Daftar posisi bot, kuantitas, entry, mark price, nilai, TP, dan SL.
