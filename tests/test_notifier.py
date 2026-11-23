@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import pathlib
 import sys
@@ -95,3 +96,45 @@ def test_main_has_single_notifier_and_alerts_before_run():
                    "gagal menyiapkan exchange",
                    "rekonsiliasi startup gagal"):
         assert f"notifier.send(" in src and marker in src, marker
+
+
+def _cfg_for(tmp_path, monkeypatch, dry: str, testnet: str) -> "BOT.Config":
+    monkeypatch.setenv("STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("SYMBOLS", "BTC/USDT")
+    monkeypatch.setenv("DRY_RUN", dry)
+    monkeypatch.setenv("BINANCE_TESTNET", testnet)
+    monkeypatch.setenv("BINANCE_API_KEY", "dummy-key")
+    monkeypatch.setenv("BINANCE_API_SECRET", "dummy-secret")
+    return BOT.Config.from_env()
+
+
+@pytest.mark.parametrize("dry,testnet,label", [
+    ("true", "false", "DRY RUN"),
+    ("false", "true", "TESTNET"),
+    ("false", "false", "LIVE"),
+])
+def test_start_notification_labels_actual_mode(tmp_path, monkeypatch, dry, testnet, label):
+    """Notifikasi startup harus menyebut mode sebenarnya, bukan dry/live biner."""
+    cfg = _cfg_for(tmp_path, monkeypatch, dry, testnet)
+    state = BOT.new_state(cfg.state_file, cfg)
+    assert BOT.state_mode(cfg) == ("dry" if dry == "true" else ("testnet" if testnet == "true" else "live"))
+    sent = []
+
+    class Capture:
+        def send(self, text):
+            sent.append(text)
+
+    bot = BOT.Bot(cfg, None, BOT.PaperBroker(state, cfg.paper_fee), Capture(), state)
+    bot.running = False
+    bot.run()
+    assert sent == [f"Bot dimulai ({label})", "Bot dihentikan"]
+
+
+def test_new_state_rejects_mode_mismatch(tmp_path, monkeypatch):
+    """State dry tidak boleh dipakai ulang oleh mode testnet (penyebab exit 2 saat startup)."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"bot_mode": "dry", "symbols": {}, "events": []}), encoding="utf-8")
+    cfg = _cfg_for(tmp_path, monkeypatch, "false", "true")
+    with pytest.raises(RuntimeError, match="tidak cocok dengan testnet"):
+        BOT.new_state(cfg.state_file, cfg)
+    assert BOT.state_mode(cfg) == "testnet"

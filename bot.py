@@ -766,11 +766,12 @@ class Bot:
         st["pending_order"] = None
         st.update(status="in_position", position=pos, last_trade_ts=now)
         st["entries"].append(now)
-        diag["reason"] = "BUY berhasil dibuka" + (" (DRY RUN)" if self.cfg.dry_run else "")
+        tag = "" if state_mode(self.cfg) == "live" else f" [{mode_label(self.cfg)}]"
+        diag["reason"] = "BUY berhasil dibuka" + tag
         self.save()
         if not self.cfg.dry_run and self.cfg.use_oco:
             self.arm_oco(symbol, st, pos)
-        self.notify(f"BUY {symbol}{' [DRY RUN]' if self.cfg.dry_run else ''} @ {result['price']:g}; TP {pos['tp']:g}, SL {pos['sl']:g}")
+        self.notify(f"BUY {symbol}{tag} @ {result['price']:g}; TP {pos['tp']:g}, SL {pos['sl']:g}")
 
     def handle_exception(self, symbol: str, exc: Exception):
         text = f"{type(exc).__name__}: {str(exc)[:240]}"
@@ -873,7 +874,7 @@ class Bot:
         self.last_portfolio_update = now
 
     def run(self):
-        self.notify("Bot dimulai" + (" (DRY RUN)" if self.cfg.dry_run else " (LIVE)"))
+        self.notify(f"Bot dimulai ({mode_label(self.cfg)})")
         while self.running:
             if time.time() >= self.pause_until:
                 for symbol in self.cfg.symbols:
@@ -897,12 +898,20 @@ class Bot:
         self.notify("Bot dihentikan")
 
 
+def state_mode(cfg: Config) -> str:
+    return "dry" if cfg.dry_run else ("testnet" if cfg.testnet else "live")
+
+
+def mode_label(cfg: Config) -> str:
+    return {"dry": "DRY RUN", "testnet": "TESTNET", "live": "LIVE"}[state_mode(cfg)]
+
+
 def new_state(path: str, cfg: Config) -> dict:
     state = {}
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             state = json.load(f)
-    mode = "dry" if cfg.dry_run else ("testnet" if cfg.testnet else "live")
+    mode = state_mode(cfg)
     old = state.get("bot_mode")
     if old and old != mode:
         raise RuntimeError(f"State mode {old} tidak cocok dengan {mode}; rekonsiliasi manual")

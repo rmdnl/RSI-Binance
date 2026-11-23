@@ -294,6 +294,8 @@ Untuk mengaktifkannya:
 
 Notifikasi hanya aktif jika token dan chat ID sama-sama tersedia. Jika salah satu variabel kosong, bot tetap berjalan tanpa notifikasi dan menulis warning `Telegram tidak dikonfigurasi` di log saat startup.
 
+Notifikasi startup menyebut mode yang benar-benar aktif — `Bot dimulai (DRY RUN)`, `Bot dimulai (TESTNET)`, atau `Bot dimulai (LIVE)` — dan notifikasi `BUY` diberi penanda `[DRY RUN]` atau `[TESTNET]`.
+
 Semua kegagalan yang terjadi sebelum loop utama berjalan juga dikirim ke Telegram, bukan hanya tercatat di log: gagal menyiapkan exchange, state yang perlu rekonsiliasi manual, saldo gagal dibaca, rekonsiliasi startup gagal, dan proses lain yang masih memegang lock. Kegagalan pengiriman Telegram sendiri dicatat di log beserta status HTTP dan badan respons, misalnya `Telegram gagal: HTTP 401 {"description":"Unauthorized"}`.
 
 Untuk memastikan jalur notifikasi berfungsi tanpa menjalankan bot:
@@ -762,7 +764,7 @@ Jalankan dari direktori repository dengan virtual environment aktif:
 pytest -q
 ```
 
-Unit test yang tersedia (`tests/test_safety.py`, `tests/test_backtest.py`, dan `tests/test_notifier.py`; 25 kasus) mencakup:
+Unit test yang tersedia (`tests/test_safety.py`, `tests/test_backtest.py`, dan `tests/test_notifier.py`; 29 kasus) mencakup:
 
 - RSI pada data yang naik monotonis bernilai 100.
 - RSI pada data flat bernilai 100 (regresi sentinel lama `50`).
@@ -787,6 +789,8 @@ Unit test yang tersedia (`tests/test_safety.py`, `tests/test_backtest.py`, dan `
 - Notifier tidak mengirim apa pun bila token/chat ID kosong, dan mencatat status HTTP serta tipe exception saat pengiriman gagal.
 - `run()` memancarkan notifikasi start lalu stop meskipun loop langsung dihentikan.
 - Hanya ada satu pembuatan `Notifier` di `main()` dan setiap jalur keluar sebelum `run()` mengirim peringatan.
+- Notifikasi startup menyebut mode sebenarnya (`DRY RUN`, `TESTNET`, atau `LIVE`), bukan hanya dry/live biner.
+- `new_state` menolak state dengan mode berbeda (`State mode dry tidak cocok dengan testnet`), sehingga state DRY RUN tidak pernah dipakai ulang oleh Testnet atau live.
 
 Unit test tidak mengirim order dan tidak membuktikan profitabilitas atau keamanan seluruh skenario live.
 
@@ -803,6 +807,21 @@ Pastikan virtual environment aktif, kemudian jalankan:
 ```bash
 pip install -r requirements.txt
 ```
+
+### Service restart berulang dan keluar dengan status 2
+
+Jika `journalctl -u <unit>` menunjukkan `Main process exited, code=exited, status=2` bersamaan dengan `State perlu rekonsiliasi manual: State mode dry tidak cocok dengan testnet`, artinya `state.json` berasal dari mode lain. Mode aktif ditentukan `DRY_RUN` dan `BINANCE_TESTNET` di `.env`.
+
+Jangan mengedit `bot_mode` di dalam state untuk melewati pemeriksaan — arsipkan state lama agar bot membuat state baru yang bersih untuk mode aktif:
+
+```bash
+sudo systemctl stop <unit>
+cd /home/ubuntu/RSI-Binance
+mv state.json "state.json.$(date +%Y%m%d-%H%M%S).bak"
+sudo systemctl start <unit>
+```
+
+Lakukan hanya saat tidak ada posisi terbuka, dan hanya bila state lama memang berasal dari mode simulasi. State live yang tidak cocok tidak boleh diarsipkan tanpa memeriksa saldo dan open order lebih dulu.
 
 ### Notifikasi Telegram tidak muncul
 
