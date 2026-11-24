@@ -1,9 +1,11 @@
 """Read-only local dashboard. Defaults to 127.0.0.1:8060."""
 from __future__ import annotations
 import json, math, os, time
+from pathlib import Path
 from typing import Any, TypeGuard
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HOST=os.getenv("DASHBOARD_HOST","127.0.0.1");PORT=int(os.getenv("DASHBOARD_PORT","8060"));STATE_FILE=os.getenv("STATE_FILE","state.json")
+STATIC_DIR = Path(__file__).parent / "static"
 RSI_TF_COLORS = {"15m": "#38bdf8", "1h": "#fbbf24", "4h": "#a78bfa"}
 RSI_PAIR_DASHES = ["", "6 3", "2 3", "8 3 2 3"]
 
@@ -80,7 +82,7 @@ def status_payload(state):
     }
 
 
-PAGE='''<!doctype html><html lang="id"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>RSI Bot Operations</title><script src="https://unpkg.com/react@18/umd/react.production.min.js"></script><script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script><script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script><script src="https://unpkg.com/recharts@2.15.4/umd/Recharts.js"></script><style>
+PAGE='''<!doctype html><html lang="id"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>RSI Bot Operations</title><script src="/static/react.min.js"></script><script src="/static/react-dom.min.js"></script><script src="/static/prop-types.min.js"></script><script src="/static/recharts.min.js"></script><style>
 body{font:15px system-ui;background:#10151d;color:#e8eef6;margin:2rem}h1{color:#7dd3fc}.muted{color:#aab8ca}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}.card{background:#1b2532;padding:1rem;border-radius:10px;overflow:auto}.value{font-size:1.35rem;font-weight:700;margin-top:.4rem}table{width:100%;border-collapse:collapse;min-width:650px}td,th{text-align:left;padding:.6rem;border-bottom:1px solid #344256}.warn{color:#fbbf24}.error{color:#fca5a5}.info{color:#93c5fd}.pos{color:#86efac}.neg{color:#fca5a5}section{margin-top:1.4rem}.event{padding:.55rem;border-bottom:1px solid #344256;white-space:pre-wrap;overflow-wrap:anywhere}.chart-wrap{height:360px;min-width:0}.pair-picks{display:flex;flex-wrap:wrap;gap:.8rem;margin:.8rem 0}.pair-picks label{display:flex;gap:.35rem;align-items:center;color:#cbd5e1}.chart-empty{padding:2rem;text-align:center;color:#aab8ca}.alert-card{border-left:4px solid #f59e0b}.alert-card h2{margin-top:0;font-size:1.05rem}
 </style><h1>RSI Binance — Portfolio &amp; health</h1><p id="meta" class="muted">Memuat snapshot…</p><div id="content"></div><script>
 const TF_ORDER=['15m','1h','4h'],TF_COLORS=__TF_COLORS__,DASHES=__DASHES__,OVERSOLD_FALLBACK=__OVERSOLD_FALLBACK__;const fmt=(x,n=4)=>x==null?'—':Number(x).toLocaleString(undefined,{maximumFractionDigits:n});const safe=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -133,15 +135,46 @@ PAGE = (PAGE.replace('__TF_COLORS__', json.dumps(RSI_TF_COLORS))
            .replace('__OVERSOLD_FALLBACK__', json.dumps(OVERSOLD_FALLBACK)))
 class Handler(BaseHTTPRequestHandler):
  def do_GET(self):
-  if self.path=='/':body=PAGE.encode('utf-8');status=200;ctype='text/html; charset=utf-8'
-  elif self.path=='/api/status':
-   try:
-    with open(STATE_FILE,encoding='utf-8') as f:state=json.load(f)
-    body=json.dumps(status_payload(state),allow_nan=False).encode();status=200
-   except FileNotFoundError:body=b'{"error":"state file not found"}';status=404
-   except (OSError,ValueError,TypeError):body=b'{"error":"state file unreadable"}';status=503
-   ctype='application/json; charset=utf-8'
-  else:body=b'not found';status=404;ctype='text/plain'
-  self.send_response(status);self.send_header('Content-Type',ctype);self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+  # Serve static files
+  if self.path.startswith("/static/"):
+    file_path = STATIC_DIR / self.path[len("/static/"):]
+    try:
+      with open(file_path, "rb") as f:
+        body = f.read()
+      status = 200
+      if file_path.suffix == ".js":
+        ctype = "application/javascript; charset=utf-8"
+      elif file_path.suffix == ".css":
+        ctype = "text/css; charset=utf-8"
+      else:
+        ctype = "application/octet-stream"
+    except (FileNotFoundError, OSError):
+      body = b"not found"; status = 404; ctype = "text/plain"
+  elif self.path == "/":
+    body = PAGE.encode("utf-8"); status = 200; ctype = "text/html; charset=utf-8"
+  elif self.path == "/api/status":
+    try:
+      with open(STATE_FILE, encoding="utf-8") as f:
+        state = json.load(f)
+      body = json.dumps(status_payload(state), allow_nan=False).encode()
+      status = 200
+    except FileNotFoundError:
+      body = b'{"error":"state file not found"}'; status = 404
+    except (OSError, ValueError, TypeError):
+      body = b'{"error":"state file unreadable"}'; status = 503
+    ctype = "application/json; charset=utf-8"
+  else:
+    body = b"not found"; status = 404; ctype = "text/plain"
+  self.send_response(status)
+  self.send_header("Content-Type", ctype)
+  self.send_header("Cache-Control", "no-store")
+  self.send_header("X-Content-Type-Options", "nosniff")
+  self.send_header("Content-Length", str(len(body)))
+  self.end_headers()
+  self.wfile.write(body)
  def log_message(self,*args):pass
-if __name__=='__main__':print(f'Read-only dashboard: http://{HOST}:{PORT} (state={STATE_FILE})');ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    print(f"Read-only dashboard: http://{HOST}:{PORT} (state={STATE_FILE})")
+    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
