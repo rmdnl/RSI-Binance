@@ -821,7 +821,7 @@ Jalankan dari direktori repository dengan virtual environment aktif:
 pytest -q
 ```
 
-Unit test yang tersedia (`tests/test_safety.py` 16 kasus, `tests/test_backtest.py` 4 kasus, `tests/test_notifier.py` 13 kasus, `tests/test_dashboard.py` 15 kasus; total 48 kasus) mencakup:
+Unit test yang tersedia (`tests/test_safety.py` 24 kasus, `tests/test_backtest.py` 10 kasus, `tests/test_notifier.py` 13 kasus, `tests/test_dashboard.py` 19 kasus; total 66 kasus) mencakup:
 
 - RSI pada data yang naik monotonis bernilai 100.
 - RSI pada data flat bernilai 100 (regresi sentinel lama `50`).
@@ -833,6 +833,10 @@ Unit test yang tersedia (`tests/test_safety.py` 16 kasus, `tests/test_backtest.p
 - `poll_oco` bersifat fail-closed (`unknown`) saat exchange error.
 - `Config.from_env` menolak nilai integer non-bulat.
 - `update_rsi_history` membuang sampel di luar window 24 jam namun tetap menyimpan sampel lama yang masih di dalam window.
+- `update_rsi_history` menandai titik candle 1 jam berjalan (`live: true`), lalu penanda itu hilang dan nilainya menjadi final setelah candle tersebut ditutup.
+- `refresh_live_history` memperbarui titik berjalan memakai cache candle tertutup + harga ticker tanpa satu pun request klines tambahan, menghormati `HISTORY_REFRESH_SECONDS`, dan tidak berjalan pada mode `SIGNAL_USE_CLOSED=true` atau sebelum ada evaluasi pertama.
+- Jejak `diagnostics.rsi_live`/`rsi_live_at` bertahan saat `scan_entry` menulis ulang blok `diagnostics` pada evaluasi berikutnya.
+- Halaman dashboard menyebut `HISTORY_REFRESH_SECONDS` dan menjelaskan bahwa titik terakhir grafik adalah candle 1 jam berjalan.
 - `scan_entry` hanya meminta candle 1h, menulis `diagnostics` (`rsi`, `rsi_previous`, `timeframe`) dan `rsi_history["1h"]` saat pair belum memenuhi syarat entry, termasuk parameter efektif `oversold` dan `trigger` yang dipakai dashboard untuk menghitung alert.
 - `new_state` membuang histori timeframe lama (mis. `15m`/`4h`) dari state yang dibuat versi sebelumnya.
 - `update_portfolio` menulis snapshot dashboard lengkap pada mode dry run (equity, unrealized/realized PnL, posisi, saldo).
@@ -852,7 +856,7 @@ Unit test yang tersedia (`tests/test_safety.py` 16 kasus, `tests/test_backtest.p
 - Hanya ada satu pembuatan `Notifier` di `main()` dan setiap jalur keluar sebelum `run()` mengirim peringatan.
 - Notifikasi startup menyebut mode sebenarnya (`DRY RUN`, `TESTNET`, atau `LIVE`), bukan hanya dry/live biner.
 - `new_state` menolak state dengan mode berbeda (`State mode dry tidak cocok dengan testnet`), sehingga state DRY RUN tidak pernah dipakai ulang oleh Testnet atau live.
-- Setiap timeframe grafik RSI memakai warna berbeda dan tiap pair memakai pola garis berbeda, serta setiap `Line` menerima `stroke` eksplisit (regresi: prop yang tidak dikirim membuat Recharts memakai satu warna default untuk semua garis).
+- Setiap pair memakai pola garis berbeda dan setiap `Line` menerima `stroke` eksplisit dari `RSI_TF_COLORS` (satu entri `1h` sejak migrasi single-timeframe; regresi: prop yang tidak dikirim membuat Recharts memakai satu warna default untuk semua garis).
 - Alert oversold dihitung dari ambang yang dilaporkan bot (`diagnostics.oversold`), memakai perbandingan ketat `<` (RSI sama dengan ambang belum memicu alert), mengabaikan RSI kosong/bukan angka, terurut dari yang paling oversold, dan jatuh ke default bila state belum memuat parameter.
 - `status_payload` menyertakan `alerts`, `oversold`, dan `oversold_source`, serta tetap aman untuk state kosong.
 
