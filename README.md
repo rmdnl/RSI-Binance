@@ -399,6 +399,10 @@ LOG_FILE=bot.log
 
 Loop berjalan setiap `LOOP_SECONDS`, tetapi evaluasi RSI per pair dibatasi `EVAL_SECONDS` (default 60 detik), jadi request klines tetap terkendali walau loop dipercepat. Jangan menurunkan `EVAL_SECONDS` tanpa alasan karena request yang terlalu sering dapat meningkatkan penggunaan API.
 
+### Histori candle per evaluasi (KLINE_LIMIT)
+
+Setiap evaluasi RSI meminta satu kali klines 1 jam sebanyak `KLINE_LIMIT = 1000` candle (konstanta di `bot.py`, bukan variabel `.env`). Syarat minimum perhitungan jauh lebih kecil — `RSI_PERIOD` + `ARM_LOOKBACK` + 2 = 32 candle — sehingga 1000 candle hanya berfungsi memberi margin agar Wilder smoothing sudah stabil dan `rsi_history` dashboard punya cukup titik. Memperbesarnya menambah ukuran respons dan weight request tanpa mengubah aturan sinyal; kurangi hanya bila Anda juga memperkecil `ARM_LOOKBACK` dan sudah memverifikasi RSI tetap stabil (tes `test_kline_limit_is_1000` mengunci nilainya).
+
 ## Menjalankan bot
 
 Jalankan perintah dari direktori repository dengan virtual environment aktif.

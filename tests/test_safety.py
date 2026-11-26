@@ -4,6 +4,7 @@ import tempfile
 import pytest
 
 from bot import (
+    KLINE_LIMIT,
     Config,
     LiveBroker,
     ProcessLock,
@@ -11,6 +12,11 @@ from bot import (
     atr_pct,
     rsi_series,
 )
+
+
+def test_kline_limit_is_1000():
+    """Histori candle 1h per evaluasi: 1000 candle (cukup untuk RSI Wilder + ARM_LOOKBACK)."""
+    assert KLINE_LIMIT == 1000
 
 
 def test_rsi_monotonic_up_is_100():
@@ -110,6 +116,7 @@ def test_scan_entry_records_diagnostics_and_rsi_history():
         def fetch_ohlcv(self, symbol, timeframe, limit):
             assert symbol == "BTC/USDT"
             assert timeframe == "1h", "strategi hanya boleh meminta candle 1h"
+            assert limit == KLINE_LIMIT, "histori candle 1h harus sepanjang KLINE_LIMIT"
             return candles
 
     symbol_state = new_symbol_state()
@@ -179,6 +186,7 @@ def test_scan_entry_rsi_1h_cross_opens_paper_position():
     class Exchange:
         def fetch_ohlcv(self, symbol, timeframe, limit):
             assert timeframe == "1h"
+            assert limit == KLINE_LIMIT
             return candles
 
         def fetch_ticker(self, symbol):
@@ -228,7 +236,8 @@ def _realtime_exchange(now_ms: int, live_extra: float, fetch_log: list):
 
     class Exchange:
         def fetch_ohlcv(self, symbol, timeframe, limit):
-            fetch_log.append((symbol, timeframe))
+            fetch_log.append((symbol, timeframe, limit))
+            assert limit == KLINE_LIMIT
             return list(candles)
 
         def fetch_ticker(self, symbol):

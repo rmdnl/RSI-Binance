@@ -24,6 +24,9 @@ log = logging.getLogger("bot")
 # Strategi HANYA memakai satu timeframe: RSI 1 jam pada candle tertutup.
 SIGNAL_TF = "1h"
 TF_MS = {SIGNAL_TF: 3_600_000}
+# Jumlah candle 1 jam yang diminta tiap evaluasi: cukup untuk Wilder RSI(RSI_PERIOD) +
+# ARM_LOOKBACK, dengan margin besar agar nilai RSI sudah stabil.
+KLINE_LIMIT = 1000
 TERMINAL = {"closed", "canceled", "cancelled", "expired", "rejected"}
 # Jumlah kegagalan save() beruntun sebelum alert Telegram dikirim. Visibilitas saja:
 # bot tetap berjalan dengan state di memori, perilaku trading tidak diubah.
@@ -663,7 +666,7 @@ class Bot:
             expected_open = now_ms // tf_ms * tf_ms - tf_ms
             if int(st.get("last_eval_ts") or 0) >= expected_open:
                 return
-        raw = self.ex.fetch_ohlcv(symbol, SIGNAL_TF, limit=500)
+        raw = self.ex.fetch_ohlcv(symbol, SIGNAL_TF, limit=KLINE_LIMIT)
         candles = closed(raw, tf_ms, now_ms)
         if len(candles) < self.cfg.period + self.cfg.arm + 2:
             return
