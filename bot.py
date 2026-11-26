@@ -81,6 +81,7 @@ class Config:
     rearm: float
     use_closed_candles: bool
     eval_seconds: float
+    history_refresh_seconds: float
     position_pct: float
     max_open: int
     tp_min: float
@@ -110,6 +111,7 @@ class Config:
             finite_float("RSI_TRIGGER", 32, 0, 100), finite_int("ARM_LOOKBACK", 12, 1, 500),
             finite_float("REARM_LEVEL", 50, 0, 100), boolean("SIGNAL_USE_CLOSED", False),
             finite_float("EVAL_SECONDS", 60, 1, 3600),
+            finite_float("HISTORY_REFRESH_SECONDS", 5, 1, 3600),
             finite_float("POSITION_PCT", 30, 0.0001, 100), finite_int("MAX_OPEN_POSITIONS", 3, 1, 100),
             finite_float("TP_MIN_PCT", 4, 0.0001, 100), finite_float("TP_MAX_PCT", 4, 0.0001, 100),
             finite_float("TP_ATR_MULT", 1.5, 0, 100), finite_float("SL_PCT", 5, 0.0001, 100),
@@ -173,7 +175,15 @@ def atr_pct(candles: list[list], period: int = 14, current_price: Optional[float
     return atr / ref_price * 100 if ref_price > 0 else None
 
 
-def update_rsi_history(history: dict, timeframe: str, candles: list[list], period: int, now_ms: int) -> list:
+def update_rsi_history(history: dict, timeframe: str, candles: list[list], period: int, now_ms: int,
+                       live: Optional[tuple] = None) -> list:
+    """Simpan titik RSI 1 jam untuk grafik dashboard.
+
+    Titik candle tertutup selalu ditulis ulang dari `candles`. `live=(timestamp, value)` menambah
+    satu titik untuk candle 1 jam yang SEDANG BERJALAN dengan penanda `"live": True`, sehingga
+    grafik ikut bergerak sebelum candle close; saat candle itu akhirnya tertutup, nilai finalnya
+    menimpa titik yang sama dan penanda `live` hilang.
+    """
     tf_ms = TF_MS[timeframe]
     cutoff = now_ms - 24 * 60 * 60 * 1000
     rows = {int(row["timestamp"]): float(row["value"])
@@ -185,7 +195,15 @@ def update_rsi_history(history: dict, timeframe: str, candles: list[list], perio
         ts = int(candle[0])
         if ts >= cutoff and ts + tf_ms <= now_ms and value is not None and math.isfinite(float(value)):
             rows[ts] = float(value)
-    history[timeframe] = [{"timestamp": ts, "value": rows[ts]} for ts in sorted(rows)][-100:]
+    live_ts = None
+    if live is not None:
+        live_ts, live_value = int(live[0]), live[1]
+        if live_value is not None and live_ts >= cutoff and math.isfinite(float(live_value)):
+            rows[live_ts] = float(live_value)
+        else:
+            live_ts = None
+    history[timeframe] = [{"timestamp": ts, "value": rows[ts], "live": ts == live_ts}
+                          for ts in sorted(rows)][-100:]
     return history[timeframe]
 
 
@@ -383,6 +401,8 @@ class Bot:
         self.cfg, self.ex, self.broker, self.notifier, self.state = cfg, ex, broker, notifier, state
         self.running = True
         self.price_cache = {}
+        self._closed_cache: dict[str, list] = {}   # candle 1 jam tertutup terakhir per pair
+        self._history_at: dict[str, float] = {}    # kapan rsi_history terakhir diperbarui
         self.last_oco_poll = {}
         self.last_portfolio_update = 0.0
         self.pause_until = 0.0
@@ -684,7 +704,10 @@ class Bot:
         # Histori dashboard hanya dari candle tertutup (grafik stabil); nilai berjalan
         # dilaporkan terpisah di diagnostics.rsi agar gate entry dan tabel tetap sinkron.
         history = st.setdefault("rsi_history", {})
-        update_rsi_history(history, SIGNAL_TF, candles, self.cfg.period, now_ms)
+        live_point = (series[-1][0], last) if live is not None and last is not None else None
+        update_rsi_history(history, SIGNAL_TF, candles, self.cfg.period, now_ms, live=live_point)
+        self._closed_cache[symbol] = candles
+        self._history_at[symbol] = now
         diag = {"evaluated_at": now, "candle_ts": series[-1][0], "timeframe": SIGNAL_TF,
                 "candle_live": live is not None, "rsi_previous": prev, "rsi": last,
                 # Parameter efektif ikut disimpan agar dashboard bisa menghitung alert
@@ -879,6 +902,38 @@ class Bot:
         }
         self.last_portfolio_update = now
 
+    def refresh_live_history(self, symbol: str, st: dict, now: float):
+        """Perbarui titik RSI candle 1 jam BERJALAN di rsi_history tiap HISTORY_REFRESH_SECONDS.
+
+        Tidak memanggil klines: memakai cache candle tertutup dari evaluasi terakhir dan harga
+        terkini (ticker), jadi gate entry tetap berjalan pada EVAL_SECONDS sementara grafik
+        bergerak lebih cepat. Hanya aktif di mode candle berjalan.
+        """
+        if self.cfg.use_closed_candles:
+            return
+        if now - float(self._history_at.get(symbol) or 0.0) < self.cfg.history_refresh_seconds:
+            return
+        candles = self._closed_cache.get(symbol)
+        if not candles:
+            return
+        try:
+            price = float(self.price(symbol, max_age=4))
+        except Exception:
+            return
+        values = rsi_series([c[4] for c in candles] + [price], self.cfg.period)
+        value = values[-1] if values else None
+        if value is None or not math.isfinite(float(value)):
+            return
+        now_ms = int(now * 1000)
+        open_ts = now_ms // TF_MS[SIGNAL_TF] * TF_MS[SIGNAL_TF]
+        history = st.setdefault("rsi_history", {})
+        update_rsi_history(history, SIGNAL_TF, candles, self.cfg.period, now_ms, live=(open_ts, value))
+        diag = st.get("diagnostics")
+        if isinstance(diag, dict):
+            diag["rsi_live"] = value
+            diag["rsi_live_at"] = now
+        self._history_at[symbol] = now
+
     def run(self):
         self.notify(f"Bot dimulai ({mode_label(self.cfg)})")
         while self.running:
@@ -890,6 +945,11 @@ class Bot:
                         self.process(symbol)
                     except Exception as exc:
                         self.handle_exception(symbol, exc)
+                    try:
+                        self.refresh_live_history(symbol, self.state["symbols"][symbol], time.time())
+                    except Exception as exc:
+                        self.event("ERROR", f"Refresh rsi_history {symbol} gagal: "
+                                            f"{type(exc).__name__}: {str(exc)[:150]}")
             if time.time() - self.last_portfolio_update >= 30:
                 try:
                     self.update_portfolio()

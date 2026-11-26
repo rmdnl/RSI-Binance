@@ -327,6 +327,7 @@ RSI_TRIGGER=32
 ARM_LOOKBACK=12
 SIGNAL_USE_CLOSED=false
 EVAL_SECONDS=60
+HISTORY_REFRESH_SECONDS=5
 ```
 
 | Variabel | Fungsi |
@@ -337,6 +338,7 @@ EVAL_SECONDS=60
 | `ARM_LOOKBACK` | Jumlah candle 1 jam untuk mencari kondisi oversold sebelumnya (default `12` = 12 jam) |
 | `SIGNAL_USE_CLOSED` | `false` (default) = candle 1 jam berjalan/realtime; `true` = hanya candle tertutup |
 | `EVAL_SECONDS` | Jeda minimum antar evaluasi RSI per pair pada mode realtime (default `60`) |
+| `HISTORY_REFRESH_SECONDS` | Seberapa sering titik candle 1 jam berjalan di grafik dashboard diperbarui (default `5`); tidak menambah request klines, dan tidak bisa lebih cepat dari `LOOP_SECONDS` |
 
 Strategi hanya memakai RSI pada timeframe 1 jam. Variabel `RSI_4H_MAX`, `RSI_1H_MAX`, dan `CONTEXT_USE_CLOSED` sudah dihapus; bila masih ada di `.env`, nilainya diabaikan dan tidak memengaruhi keputusan entry.
 
@@ -516,7 +518,7 @@ Dashboard melakukan refresh otomatis setiap **5 detik**.
 Informasi yang ditampilkan:
 
 - Mode bot dan quote asset.
-- Diagnostik RSI per pair (RSI 1h, status, alasan gate entry) dan grafik interaktif tren RSI 1h selama 24 jam terakhir untuk pair yang dipilih. Semua garis memakai warna 1 jam `#fbbf24`; bila lebih dari satu pair dipilih, pola garis putus-putus membedakan pair. Warna dan pola itu berasal dari konstanta `RSI_TF_COLORS` dan `RSI_PAIR_DASHES` di `dashboard.py`, jadi mengubahnya cukup di satu tempat. Histori memakai candle 1h tertutup yang sama dengan sumber sinyal bot dan disimpan dalam state, sehingga grafik, tabel diagnostik, dan gate entry selalu konsisten.
+- Diagnostik RSI per pair (RSI 1h, status, alasan gate entry) dan grafik interaktif tren RSI 1h selama 24 jam terakhir untuk pair yang dipilih. Semua garis memakai warna 1 jam `#fbbf24`; bila lebih dari satu pair dipilih, pola garis putus-putus membedakan pair. Warna dan pola itu berasal dari konstanta `RSI_TF_COLORS` dan `RSI_PAIR_DASHES` di `dashboard.py`, jadi mengubahnya cukup di satu tempat. Histori menyimpan candle 1h tertutup plus satu titik candle 1 jam berjalan (penanda `live`), sehingga garis ikut bergerak sebelum candle close; titik itu diperbarui tiap `HISTORY_REFRESH_SECONDS` detik memakai cache candle tertutup + harga ticker (tanpa request klines tambahan), dan nilainya berubah menjadi final saat candle tersebut ditutup. Semua data disimpan di state, jadi grafik, tabel diagnostik, dan gate entry membaca sumber yang sama.
 - **Alert oversold**: banner di bagian atas halaman berisi pair yang RSI 1h terkini berada di bawah parameter `RSI_OVERSOLD`, terurut dari yang paling oversold, dan baris pair terkait ditandai pada tabel diagnostik. Ambang diambil dari `diagnostics.oversold` yang dilaporkan bot di state, sehingga alert memakai parameter yang sama dengan gate entry; bila state belum memuatnya (state lama sebelum fitur ini), dashboard memakai default `18` atau `DASHBOARD_RSI_OVERSOLD` dan menandai sumbernya di banner. Perbandingan bersifat ketat: RSI tepat sama dengan ambang belum memicu alert. Alert hanya pemberitahuan — bot tetap membeli hanya setelah RSI 1h menembus ke atas `RSI_TRIGGER`.
 - Equity estimasi beserta label valuasi (portofolio kertas pada dry run, mark-to-market pada live).
 - Unrealized PnL dan realized PnL.

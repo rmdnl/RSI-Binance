@@ -159,3 +159,9 @@ def test_page_renders_alert_banner_and_uses_state_threshold():
     assert f"OVERSOLD_FALLBACK={json.dumps(dashboard.OVERSOLD_FALLBACK)}" in dashboard.PAGE
     assert re.search(r"create\(R\.ReferenceLine,\{[^}]*y:ov", dashboard.PAGE), "garis oversold harus memakai ambang"
     assert "y:18," not in dashboard.PAGE, "ambang tidak boleh hardcoded"
+
+def test_page_documents_live_history_point_and_refresh_setting():
+    """Grafik kini memuat titik candle berjalan; halaman harus menjelaskannya."""
+    assert "HISTORY_REFRESH_SECONDS" in dashboard.PAGE
+    assert "candle 1 jam yang sedang berjalan" in dashboard.PAGE
+    assert "titik sebelumnya adalah candle tertutup" in dashboard.PAGE

@@ -98,7 +98,7 @@ def test_update_rsi_history_keeps_persisted_rows_inside_window():
 
     rows = update_rsi_history(history, "1h", [], 14, now_ms)
 
-    assert rows == [{"timestamp": now_ms - 2 * tf_ms, "value": 41.5}]
+    assert rows == [{"timestamp": now_ms - 2 * tf_ms, "value": 41.5, "live": False}]
 
 
 def test_scan_entry_records_diagnostics_and_rsi_history():
@@ -123,7 +123,7 @@ def test_scan_entry_records_diagnostics_and_rsi_history():
     state = {"symbols": {"BTC/USDT": symbol_state}}
     config = SimpleNamespace(period=14, arm=12, trigger=32, oversold=18, rearm=50, lockout=120,
                              window_hours=24, max_entries=2, max_open=3,
-                             use_closed_candles=False, eval_seconds=60.0)
+                             use_closed_candles=False, eval_seconds=60.0, history_refresh_seconds=5.0)
     bot = Bot(config, Exchange(), None, None, state)
     bot.save = lambda: None
 
@@ -200,7 +200,7 @@ def test_scan_entry_rsi_1h_cross_opens_paper_position():
                           window_hours=24.0, max_entries=2, max_open=3, position_pct=30.0,
                           tp_min=4.0, tp_max=4.0, tp_atr=1.5, sl_pct=5.0, dry_run=True,
                           use_oco=False, cooldown=240.0, quote="USDT", paper_fee=0.1,
-                          use_closed_candles=False, eval_seconds=60.0)
+                          use_closed_candles=False, eval_seconds=60.0, history_refresh_seconds=5.0)
     symbol_state = state["symbols"]["BTC/USDT"]
     bot = Bot(cfg, Exchange(), PaperBroker(state, cfg.paper_fee), Notifier("", ""), state)
     bot.save = lambda: None
@@ -256,12 +256,12 @@ def _realtime_cfg(**kw):
                 window_hours=24.0, max_entries=2, max_open=3, position_pct=30.0,
                 tp_min=4.0, tp_max=4.0, tp_atr=1.5, sl_pct=5.0, dry_run=True,
                 use_oco=False, cooldown=240.0, quote="USDT", paper_fee=0.1,
-                use_closed_candles=False, eval_seconds=60.0)
+                use_closed_candles=False, eval_seconds=60.0, history_refresh_seconds=5.0)
     base.update(kw)
     return SimpleNamespace(**base)
 
 
-def test_scan_entry_uses_running_candle_and_keeps_history_closed():
+def test_scan_entry_uses_running_candle_and_marks_history_live():
     from bot import Bot, Notifier, PaperBroker, new_symbol_state
 
     now_ms = 1_800_000_000_000
@@ -283,7 +283,9 @@ def test_scan_entry_uses_running_candle_and_keeps_history_closed():
     assert symbol_state["status"] == "in_position", diagnostic["reason"]
     assert symbol_state["position"]["entry"] == live_close
     history = symbol_state["rsi_history"]["1h"]
-    assert max(row["timestamp"] for row in history) < now_ms, "candle berjalan tidak boleh masuk histori"
+    assert history[-1]["timestamp"] == now_ms, "titik terakhir = candle 1 jam berjalan"
+    assert history[-1]["live"] is True, "titik berjalan harus bertanda live"
+    assert all(row["live"] is False for row in history[:-1]), "candle tertutup tidak bertanda live"
 
 
 def test_scan_entry_throttles_and_closed_mode_waits_for_next_candle():
@@ -310,6 +312,76 @@ def test_scan_entry_throttles_and_closed_mode_waits_for_next_candle():
             assert len(fetches) == 1, "mode closed tidak fetch sebelum candle 1 jam baru close"
         else:
             assert len(fetches) == 2, "mode realtime mengevaluasi ulang candle berjalan"
+
+
+def test_update_rsi_history_marks_live_point_then_drops_flag_after_close():
+    from bot import update_rsi_history
+
+    tf = 3_600_000
+    base = 1_800_000_000_000 // tf * tf
+    candles = [[base - (3 - i) * tf, 100 + i, 101 + i, 99 + i, 100 + i, 1.0] for i in range(3)]
+    hist: dict = {}
+
+    points = update_rsi_history(hist, "1h", candles, 2, base + 30 * 60 * 1000, live=(base, 61.5))
+    assert points[-1] == {"timestamp": base, "value": 61.5, "live": True}
+    assert points[-2]["live"] is False
+
+    closed = candles + [[base, 100.0, 105.0, 99.0, 104.0, 1.0]]
+    points = update_rsi_history(hist, "1h", closed, 2, base + tf, live=None)
+    assert points[-1]["timestamp"] == base
+    assert points[-1]["live"] is False, "setelah candle close penanda live harus hilang"
+    assert points[-1]["value"] != 61.5
+
+
+def test_refresh_live_history_updates_running_point_without_klines():
+    from bot import Bot, Notifier, PaperBroker, new_symbol_state
+
+    now_ms = 1_800_000_000_000
+    now = now_ms / 1000
+    fetches: list = []
+    exchange, _, _ = _realtime_exchange(now_ms, 0.02, fetches)
+    ticker_calls: list = []
+    original_ticker = exchange.fetch_ticker
+    exchange.fetch_ticker = lambda symbol: (ticker_calls.append(symbol), original_ticker(symbol))[1]
+    state = {"symbols": {"BTC/USDT": new_symbol_state()}, "paper_quote": 1000.0}
+    st = state["symbols"]["BTC/USDT"]
+    cfg = _realtime_cfg()
+    bot = Bot(cfg, exchange, PaperBroker(state, cfg.paper_fee), Notifier("", ""), state)
+    bot.save = lambda: None
+    bot.persist = lambda *a, **k: None
+
+    bot.scan_entry("BTC/USDT", st, now)
+    klines_after_scan = len(fetches)
+
+    bot.refresh_live_history("BTC/USDT", st, now + 5)
+
+    history = st["rsi_history"]["1h"]
+    assert history[-1]["timestamp"] == now_ms and history[-1]["live"] is True
+    assert len(fetches) == klines_after_scan, "refresh tidak boleh menambah request klines"
+    assert ticker_calls, "refresh memakai harga ticker"
+    value_after_refresh = history[-1]["value"]
+
+    bot.refresh_live_history("BTC/USDT", st, now + 7)  # < HISTORY_REFRESH_SECONDS
+    assert st["rsi_history"]["1h"][-1]["value"] == value_after_refresh
+
+    closed_bot = Bot(_realtime_cfg(use_closed_candles=True), exchange, None, None, state)
+    closed_bot.save = lambda: None
+    before = len(ticker_calls)
+    closed_bot.refresh_live_history("BTC/USDT", st, now + 100)
+    assert len(ticker_calls) == before, "mode closed tidak memperbarui titik berjalan"
+
+
+def test_refresh_live_history_skips_without_cached_candles():
+    from bot import Bot, new_symbol_state
+
+    state = {"symbols": {"BTC/USDT": new_symbol_state()}, "paper_quote": 1000.0}
+    st = state["symbols"]["BTC/USDT"]
+    bot = Bot(_realtime_cfg(), object(), None, None, state)
+    bot.save = lambda: None
+
+    bot.refresh_live_history("BTC/USDT", st, 1_800_000_000.0)  # belum ada evaluasi/scan
+
+    assert "rsi_history" not in st or not st["rsi_history"].get("1h")
 
 
 def test_update_portfolio_dry_run_writes_dashboard_snapshot(tmp_path, monkeypatch):
