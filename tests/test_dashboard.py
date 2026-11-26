@@ -49,6 +49,20 @@ def _state(symbols):
     return {"bot_mode": "testnet", "symbols": symbols}
 
 
+def test_alert_exposes_candle_mode_flag():
+    state = _state({"BTC/USDT": {"diagnostics": _diag(16.0, candle_live=True)},
+                    "ETH/USDT": {"diagnostics": _diag(16.5, candle_live=False)}})
+    rows = {a["symbol"]: a for a in dashboard.rsi_oversold_alerts(state)}
+    assert rows["BTC/USDT"]["candle_live"] is True
+    assert rows["ETH/USDT"]["candle_live"] is False
+
+
+def test_page_shows_candle_mode_column():
+    assert "<th>Candle</th>" in dashboard.PAGE
+    assert "z.candle_live===true?'berjalan'" in dashboard.PAGE
+    assert "a.candle_live?" in dashboard.PAGE
+
+
 def test_alert_flags_symbol_below_oversold():
     state = _state({"BTC/USDT": {"diagnostics": _diag(16.4)}})
     alerts = dashboard.rsi_oversold_alerts(state)

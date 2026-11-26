@@ -29,11 +29,12 @@ Bot trading **Binance Spot multi-pair** berbasis konfirmasi RSI 1 jam (satu time
 ## Fitur
 
 - Strategi RSI satu timeframe untuk Binance Spot.
-- Evaluasi sinyal entry hanya pada candle 1 jam yang sudah tertutup.
+- Evaluasi sinyal entry pada candle 1 jam berjalan (realtime) secara default, atau hanya candle tertutup bila `SIGNAL_USE_CLOSED=true`.
 - Tidak memakai timeframe 15 menit, 4 jam, maupun filter konteks HTF.
 - RSI menggunakan metode Wilder/RMA.
 - Position sizing berdasarkan persentase equity.
 - Take profit dinamis berdasarkan ATR 1 jam, dengan batas minimum dan maksimum.
+- Sinyal RSI 1 jam dari candle yang sedang berjalan (realtime) secara default, dengan opsi `SIGNAL_USE_CLOSED=true` untuk kembali ke candle tertutup saja.
 - Stop loss, cooldown, re-entry lockout, dan RSI re-arm setelah transaksi.
 - Batas jumlah posisi terbuka dan entry per pair dalam jendela waktu.
 - DRY RUN/paper trading tanpa mengirim order.
@@ -50,7 +51,9 @@ Bot trading **Binance Spot multi-pair** berbasis konfirmasi RSI 1 jam (satu time
 
 ### Sinyal entry
 
-Sinyal entry diproses sekali per candle 1 jam, setelah candle tersebut tertutup. Secara umum, kondisi yang diperiksa adalah:
+Sinyal entry dihitung dari RSI 1 jam. Secara default bot memakai candle 1 jam yang **sedang berjalan** (realtime): setiap `EVAL_SECONDS` detik RSI dihitung ulang dengan close = harga terkini, jadi sinyal bisa muncul sebelum candle 1 jam ditutup — dan bisa batal bila RSI kembali jatuh sebelum candle itu close. Set `SIGNAL_USE_CLOSED=true` untuk hanya memakai candle yang sudah tertutup (sinyal lebih jarang, tanpa whipsaw intra-candle); dalam mode itu sinyal dievaluasi sekali per candle 1 jam yang baru selesai.
+
+Secara umum, kondisi yang diperiksa adalah:
 
 1. RSI 1 jam sebelumnya berada pada atau di bawah `RSI_TRIGGER`.
 2. RSI 1 jam terbaru menembus ke atas `RSI_TRIGGER`.
@@ -69,6 +72,7 @@ Take profit dihitung saat entry:
 ```text
 ATR TP (%) = ATR 1 jam (%) × TP_ATR_MULT
 TP (%)     = clamp(ATR TP, TP_MIN_PCT, TP_MAX_PCT)
+             (TP_MIN_PCT = TP_MAX_PCT -> TP fixed, ATR tidak berpengaruh)
 TP price   = entry price × (1 + TP (%) / 100)
 SL price   = entry price × (1 - SL_PCT / 100)
 ```
@@ -321,6 +325,8 @@ RSI_PERIOD=14
 RSI_OVERSOLD=18
 RSI_TRIGGER=32
 ARM_LOOKBACK=12
+SIGNAL_USE_CLOSED=false
+EVAL_SECONDS=60
 ```
 
 | Variabel | Fungsi |
@@ -329,8 +335,10 @@ ARM_LOOKBACK=12
 | `RSI_OVERSOLD` | Ambang oversold untuk proses arm sinyal (default `18`) |
 | `RSI_TRIGGER` | Level RSI 1 jam yang harus ditembus ke atas (default `32`) |
 | `ARM_LOOKBACK` | Jumlah candle 1 jam untuk mencari kondisi oversold sebelumnya (default `12` = 12 jam) |
+| `SIGNAL_USE_CLOSED` | `false` (default) = candle 1 jam berjalan/realtime; `true` = hanya candle tertutup |
+| `EVAL_SECONDS` | Jeda minimum antar evaluasi RSI per pair pada mode realtime (default `60`) |
 
-Strategi hanya memakai RSI pada candle 1 jam yang sudah tertutup. Variabel `RSI_4H_MAX`, `RSI_1H_MAX`, dan `CONTEXT_USE_CLOSED` sudah dihapus; bila masih ada di `.env`, nilainya diabaikan dan tidak memengaruhi keputusan entry.
+Strategi hanya memakai RSI pada timeframe 1 jam. Variabel `RSI_4H_MAX`, `RSI_1H_MAX`, dan `CONTEXT_USE_CLOSED` sudah dihapus; bila masih ada di `.env`, nilainya diabaikan dan tidak memengaruhi keputusan entry.
 
 ### 5. Ukuran posisi
 
@@ -347,14 +355,14 @@ Perhatikan bahwa alokasi posisi bukan jaminan batas kerugian. Pergerakan harga, 
 ### 6. Take profit dan stop loss
 
 ```dotenv
-TP_MIN_PCT=1.0
-TP_MAX_PCT=3.0
+TP_MIN_PCT=4.0
+TP_MAX_PCT=4.0
 TP_ATR_MULT=1.5
-SL_PCT=2.0
+SL_PCT=5.0
 USE_OCO=true
 ```
 
-- TP dihitung dari ATR 1H dikalikan `TP_ATR_MULT`.
+- TP dihitung dari ATR 1 jam dikalikan `TP_ATR_MULT`, lalu dipatok (clamp) antara `TP_MIN_PCT` dan `TP_MAX_PCT`. Jika keduanya sama (default `4.0`), TP menjadi fixed 4% dan ATR tidak berpengaruh.
 - Hasil TP dibatasi oleh `TP_MIN_PCT` dan `TP_MAX_PCT`.
 - SL dihitung sebagai persentase dari harga entry.
 - `USE_OCO=true`: bot mencoba memasang OCO TP/SL pada Binance untuk posisi live.
@@ -389,7 +397,7 @@ LOG_FILE=bot.log
 - `STATE_FILE`: lokasi file penyimpanan state.
 - `LOG_FILE`: lokasi file log.
 
-Walaupun loop berjalan berkala, sinyal entry hanya dievaluasi berdasarkan candle 1 jam yang sudah tertutup; request klines baru dilakukan setelah candle 1 jam berganti. Jangan menurunkan interval tanpa alasan karena request yang terlalu sering dapat meningkatkan penggunaan API.
+Loop berjalan setiap `LOOP_SECONDS`, tetapi evaluasi RSI per pair dibatasi `EVAL_SECONDS` (default 60 detik), jadi request klines tetap terkendali walau loop dipercepat. Jangan menurunkan `EVAL_SECONDS` tanpa alasan karena request yang terlalu sering dapat meningkatkan penggunaan API.
 
 ## Menjalankan bot
 
@@ -779,7 +787,8 @@ systemctl status rsi-binance.service rsi-dashboard.service --no-pager
 sudo journalctl -u rsi-binance.service -n 20 --no-pager
 systemctl is-enabled rsi-binance.service rsi-dashboard.service   # harus "enabled" agar ikut saat boot
 systemctl show rsi-binance.service -p ActiveState -p SubState -p NRestarts
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8060/api/status
+curl -s -o /dev/null -w '%{http_code}
+' http://127.0.0.1:8060/api/status
 ```
 
 Ciri unit yang dipakai:
@@ -912,8 +921,10 @@ Handler dashboard hanya melayani path persis `/` dan `/api/status`. Membuka URL 
 Untuk memeriksa dari terminal, kedua path berikut harus menjawab `200`:
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8060/
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8060/api/status
+curl -s -o /dev/null -w '%{http_code}
+' http://127.0.0.1:8060/
+curl -s -o /dev/null -w '%{http_code}
+' http://127.0.0.1:8060/api/status
 ```
 
 ### Bot menolak pergantian mode

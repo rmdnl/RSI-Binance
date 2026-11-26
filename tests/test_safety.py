@@ -115,7 +115,8 @@ def test_scan_entry_records_diagnostics_and_rsi_history():
     symbol_state = new_symbol_state()
     state = {"symbols": {"BTC/USDT": symbol_state}}
     config = SimpleNamespace(period=14, arm=12, trigger=32, oversold=18, rearm=50, lockout=120,
-                             window_hours=24, max_entries=2, max_open=3)
+                             window_hours=24, max_entries=2, max_open=3,
+                             use_closed_candles=False, eval_seconds=60.0)
     bot = Bot(config, Exchange(), None, None, state)
     bot.save = lambda: None
 
@@ -123,6 +124,7 @@ def test_scan_entry_records_diagnostics_and_rsi_history():
 
     diagnostic = symbol_state["diagnostics"]
     assert diagnostic["timeframe"] == "1h"
+    assert diagnostic["candle_live"] is False
     assert diagnostic["rsi"] == 100.0
     assert diagnostic["rsi_previous"] == 100.0
     assert diagnostic["candle_ts"] == candles[-1][0]
@@ -188,8 +190,9 @@ def test_scan_entry_rsi_1h_cross_opens_paper_position():
     state = {"symbols": {"BTC/USDT": new_symbol_state()}, "paper_quote": 1000.0}
     cfg = SimpleNamespace(period=14, arm=12, trigger=32.0, oversold=18.0, rearm=50.0, lockout=120.0,
                           window_hours=24.0, max_entries=2, max_open=3, position_pct=30.0,
-                          tp_min=1.0, tp_max=3.0, tp_atr=1.5, sl_pct=2.0, dry_run=True,
-                          use_oco=False, cooldown=240.0, quote="USDT", paper_fee=0.1)
+                          tp_min=4.0, tp_max=4.0, tp_atr=1.5, sl_pct=5.0, dry_run=True,
+                          use_oco=False, cooldown=240.0, quote="USDT", paper_fee=0.1,
+                          use_closed_candles=False, eval_seconds=60.0)
     symbol_state = state["symbols"]["BTC/USDT"]
     bot = Bot(cfg, Exchange(), PaperBroker(state, cfg.paper_fee), Notifier("", ""), state)
     bot.save = lambda: None
@@ -203,10 +206,101 @@ def test_scan_entry_rsi_1h_cross_opens_paper_position():
     assert symbol_state["pending_order"] is None
     position = symbol_state["position"]
     assert position["entry"] == closes[-1]
-    assert position["sl"] == closes[-1] * (1 - 0.02)
-    assert 1.0 <= position["tp_pct"] <= 3.0
+    assert position["sl"] == closes[-1] * (1 - 0.05)
+    assert position["tp_pct"] == 4.0
     assert state["paper_quote"] == 700.0
     assert "BUY berhasil dibuka" in symbol_state["diagnostics"]["reason"]
+
+
+def _realtime_exchange(now_ms: int, live_extra: float, fetch_log: list):
+    """Candle 1h: 300 turun + 1 naik (tertutup, RSI ~26.6) lalu satu candle BERJALAN (RSI ~43)."""
+    tf = 3_600_000
+    closes = [60000.0]
+    for _ in range(300):
+        closes.append(closes[-1] * (1 - 0.004))
+    closes.append(closes[-1] * (1 + 0.02))
+    closed_closes = closes[:-1]          # semua kecuali candle berjalan
+    live_close = closes[-1] * (1 + live_extra)
+    count = len(closed_closes)
+    candles = [[now_ms - (count - i) * tf, c, c * 1.001, c * 0.999, c, 1.0]
+               for i, c in enumerate(closed_closes)]
+    candles.append([now_ms, live_close, live_close * 1.001, live_close * 0.999, live_close, 1.0])
+
+    class Exchange:
+        def fetch_ohlcv(self, symbol, timeframe, limit):
+            fetch_log.append((symbol, timeframe))
+            return list(candles)
+
+        def fetch_ticker(self, symbol):
+            return {"last": live_close}
+
+        def market(self, symbol):
+            return {"limits": {"cost": {"min": 5.0}}}
+
+    return Exchange(), candles, live_close
+
+
+def _realtime_cfg(**kw):
+    from types import SimpleNamespace
+
+    base = dict(period=14, arm=12, trigger=32.0, oversold=18.0, rearm=50.0, lockout=120.0,
+                window_hours=24.0, max_entries=2, max_open=3, position_pct=30.0,
+                tp_min=4.0, tp_max=4.0, tp_atr=1.5, sl_pct=5.0, dry_run=True,
+                use_oco=False, cooldown=240.0, quote="USDT", paper_fee=0.1,
+                use_closed_candles=False, eval_seconds=60.0)
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_scan_entry_uses_running_candle_and_keeps_history_closed():
+    from bot import Bot, Notifier, PaperBroker, new_symbol_state
+
+    now_ms = 1_800_000_000_000
+    now = now_ms / 1000
+    fetches: list = []
+    exchange, candles, live_close = _realtime_exchange(now_ms, 0.02, fetches)
+    state = {"symbols": {"BTC/USDT": new_symbol_state()}, "paper_quote": 1000.0}
+    symbol_state = state["symbols"]["BTC/USDT"]
+    cfg = _realtime_cfg()
+    bot = Bot(cfg, exchange, PaperBroker(state, cfg.paper_fee), Notifier("", ""), state)
+    bot.save = lambda: None
+    bot.persist = lambda *a, **k: None
+
+    bot.scan_entry("BTC/USDT", symbol_state, now)
+
+    diagnostic = symbol_state["diagnostics"]
+    assert diagnostic["candle_live"] is True
+    assert diagnostic["candle_ts"] == now_ms
+    assert symbol_state["status"] == "in_position", diagnostic["reason"]
+    assert symbol_state["position"]["entry"] == live_close
+    history = symbol_state["rsi_history"]["1h"]
+    assert max(row["timestamp"] for row in history) < now_ms, "candle berjalan tidak boleh masuk histori"
+
+
+def test_scan_entry_throttles_and_closed_mode_waits_for_next_candle():
+    from bot import Bot, new_symbol_state
+
+    now_ms = 1_800_000_000_000
+    now = now_ms / 1000
+    for cfg in (_realtime_cfg(), _realtime_cfg(use_closed_candles=True)):
+        fetches: list = []
+        exchange, _, _ = _realtime_exchange(now_ms, 0.0, fetches)
+        state = {"symbols": {"BTC/USDT": new_symbol_state()}, "paper_quote": 1000.0}
+        symbol_state = state["symbols"]["BTC/USDT"]
+        bot = Bot(cfg, exchange, None, None, state)
+        bot.save = lambda: None
+
+        bot.scan_entry("BTC/USDT", symbol_state, now)
+        assert len(fetches) == 1
+        bot.scan_entry("BTC/USDT", symbol_state, now + 5)  # dalam EVAL_SECONDS
+        assert len(fetches) == 1, "evaluasi harus dibatasi EVAL_SECONDS"
+
+        later = now + cfg.eval_seconds + 1
+        bot.scan_entry("BTC/USDT", symbol_state, later)
+        if cfg.use_closed_candles:
+            assert len(fetches) == 1, "mode closed tidak fetch sebelum candle 1 jam baru close"
+        else:
+            assert len(fetches) == 2, "mode realtime mengevaluasi ulang candle berjalan"
 
 
 def test_update_portfolio_dry_run_writes_dashboard_snapshot(tmp_path, monkeypatch):
@@ -261,7 +355,8 @@ def test_exchange_credentials_never_sent_in_dry_run(monkeypatch):
 
 def test_config_defaults_match_documented_env(monkeypatch):
     monkeypatch.setenv("SYMBOLS", "BTC/USDT")
-    for name in ("RSI_OVERSOLD", "RSI_TRIGGER", "ARM_LOOKBACK", "REARM_LEVEL", "POSITION_PCT",
+    for name in ("RSI_OVERSOLD", "RSI_TRIGGER", "ARM_LOOKBACK", "REARM_LEVEL", "SIGNAL_USE_CLOSED",
+                 "EVAL_SECONDS", "POSITION_PCT",
                  "TP_MIN_PCT", "TP_MAX_PCT", "TP_ATR_MULT", "SL_PCT", "COOLDOWN_MINUTES",
                  "REENTRY_LOCKOUT_MINUTES", "MAX_ENTRIES_PER_WINDOW", "ENTRY_WINDOW_HOURS",
                  "PAPER_FEE_PCT", "MAX_OPEN_POSITIONS", "DRY_RUN_BALANCE"):
@@ -270,7 +365,8 @@ def test_config_defaults_match_documented_env(monkeypatch):
     cfg = Config.from_env()
 
     assert (cfg.oversold, cfg.trigger, cfg.arm, cfg.rearm) == (18, 32, 12, 50)
-    assert (cfg.tp_min, cfg.tp_max, cfg.tp_atr, cfg.sl_pct) == (1.0, 3.0, 1.5, 2.0)
+    assert (cfg.tp_min, cfg.tp_max, cfg.tp_atr, cfg.sl_pct) == (4.0, 4.0, 1.5, 5.0)
+    assert (cfg.use_closed_candles, cfg.eval_seconds) == (False, 60.0)
     assert (cfg.cooldown, cfg.lockout, cfg.max_entries, cfg.window_hours) == (240.0, 120.0, 2, 24.0)
     assert (cfg.position_pct, cfg.max_open, cfg.paper_fee, cfg.dry_balance) == (30.0, 3, 0.1, 1000.0)
 

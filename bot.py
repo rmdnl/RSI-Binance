@@ -76,6 +76,8 @@ class Config:
     trigger: float
     arm: int
     rearm: float
+    use_closed_candles: bool
+    eval_seconds: float
     position_pct: float
     max_open: int
     tp_min: float
@@ -103,10 +105,11 @@ class Config:
             env("QUOTE_ASSET", "USDT").upper(), symbols,
             finite_int("RSI_PERIOD", 14, 2, 200), finite_float("RSI_OVERSOLD", 18, 0, 100),
             finite_float("RSI_TRIGGER", 32, 0, 100), finite_int("ARM_LOOKBACK", 12, 1, 500),
-            finite_float("REARM_LEVEL", 50, 0, 100),
+            finite_float("REARM_LEVEL", 50, 0, 100), boolean("SIGNAL_USE_CLOSED", False),
+            finite_float("EVAL_SECONDS", 60, 1, 3600),
             finite_float("POSITION_PCT", 30, 0.0001, 100), finite_int("MAX_OPEN_POSITIONS", 3, 1, 100),
-            finite_float("TP_MIN_PCT", 1, 0.0001, 100), finite_float("TP_MAX_PCT", 3, 0.0001, 100),
-            finite_float("TP_ATR_MULT", 1.5, 0, 100), finite_float("SL_PCT", 2, 0.0001, 100),
+            finite_float("TP_MIN_PCT", 4, 0.0001, 100), finite_float("TP_MAX_PCT", 4, 0.0001, 100),
+            finite_float("TP_ATR_MULT", 1.5, 0, 100), finite_float("SL_PCT", 5, 0.0001, 100),
             boolean("USE_OCO", True), finite_float("COOLDOWN_MINUTES", 240, 0, 525600),
             finite_float("REENTRY_LOCKOUT_MINUTES", 120, 0, 525600), finite_int("MAX_ENTRIES_PER_WINDOW", 2, 1, 1000),
             finite_float("ENTRY_WINDOW_HOURS", 24, 0.0001, 876000), finite_float("LOOP_SECONDS", 10, 1, 3600),
@@ -367,7 +370,7 @@ class LiveBroker:
 
 
 def new_symbol_state() -> dict:
-    return {"status": "idle", "cooldown_until": 0.0, "last_eval_ts": 0,
+    return {"status": "idle", "cooldown_until": 0.0, "last_eval_at": 0.0, "last_eval_ts": 0,
             "need_reset": False, "last_trade_ts": 0.0, "entries": [],
             "position": None, "pending_order": None}
 
@@ -644,27 +647,43 @@ class Bot:
         self.record_exit(symbol, st, reason, result, now)
 
     def scan_entry(self, symbol: str, st: dict, now: float):
-        """Entry hanya dari RSI 1h: arming < oversold lalu cross-up trigger pada candle tertutup."""
+        """Entry dari RSI 1 jam.
+
+        Default memakai candle 1 jam yang SEDANG BERJALAN (realtime): RSI dihitung ulang
+        setiap EVAL_SECONDS dengan close = harga terkini, dan sinyal cross-up bisa muncul
+        sebelum candle ditutup. Dengan SIGNAL_USE_CLOSED=true, nilai berjalan diabaikan dan
+        sinyal hanya dievaluasi sekali per candle tertutup (perilaku lama).
+        """
         now_ms = int(now * 1000)
         tf_ms = TF_MS[SIGNAL_TF]
-        expected_open = now_ms // tf_ms * tf_ms - tf_ms
-        if st["last_eval_ts"] >= expected_open:
+        if now - float(st.get("last_eval_at") or 0.0) < self.cfg.eval_seconds:
             return
-        candles = closed(self.ex.fetch_ohlcv(symbol, SIGNAL_TF, limit=500), tf_ms, now_ms)
+        if self.cfg.use_closed_candles:
+            # Mode tertutup: memanggil API sebelum candle 1 jam baru close tidak ada gunanya.
+            expected_open = now_ms // tf_ms * tf_ms - tf_ms
+            if int(st.get("last_eval_ts") or 0) >= expected_open:
+                return
+        raw = self.ex.fetch_ohlcv(symbol, SIGNAL_TF, limit=500)
+        candles = closed(raw, tf_ms, now_ms)
         if len(candles) < self.cfg.period + self.cfg.arm + 2:
             return
-        if candles[-1][0] <= st["last_eval_ts"]:
-            return
-        st["last_eval_ts"] = candles[-1][0]
-        values = rsi_series([c[4] for c in candles], self.cfg.period)
+        live = None
+        if not self.cfg.use_closed_candles and raw and raw[-1][0] + tf_ms > now_ms \
+                and (not candles or raw[-1][0] > candles[-1][0]):
+            live = raw[-1]
+        st["last_eval_at"] = now
+        if live is None:
+            st["last_eval_ts"] = candles[-1][0]
+        series = candles + ([live] if live else [])
+        values = rsi_series([c[4] for c in series], self.cfg.period)
         prev, last = values[-2], values[-1]
 
-        # Histori + diagnostik dashboard: hanya RSI 1h dari candle tertutup, jadi tidak ada
-        # data parsial dan tidak ada request timeframe tambahan di luar sinyal itu sendiri.
+        # Histori dashboard hanya dari candle tertutup (grafik stabil); nilai berjalan
+        # dilaporkan terpisah di diagnostics.rsi agar gate entry dan tabel tetap sinkron.
         history = st.setdefault("rsi_history", {})
         update_rsi_history(history, SIGNAL_TF, candles, self.cfg.period, now_ms)
-        diag = {"evaluated_at": now, "candle_ts": candles[-1][0], "timeframe": SIGNAL_TF,
-                "rsi_previous": prev, "rsi": last,
+        diag = {"evaluated_at": now, "candle_ts": series[-1][0], "timeframe": SIGNAL_TF,
+                "candle_live": live is not None, "rsi_previous": prev, "rsi": last,
                 # Parameter efektif ikut disimpan agar dashboard bisa menghitung alert
                 # oversold dari sumber yang sama dengan gate entry bot.
                 "oversold": self.cfg.oversold, "trigger": self.cfg.trigger,
@@ -679,10 +698,11 @@ class Bot:
         if prev is None or last is None:
             finish(f"Data candle {SIGNAL_TF} belum cukup untuk menghitung RSI")
             return
+        mode_txt = "berjalan" if live is not None else "tertutup"
 
         if st["need_reset"]:
             if any(c[0] >= st["last_trade_ts"] * 1000 and value is not None and value >= self.cfg.rearm
-                   for c, value in zip(candles, values)):
+                   for c, value in zip(series, values)):
                 st["need_reset"] = False
 
         look = [value for value in values[-1 - self.cfg.arm:-1] if value is not None]
@@ -694,10 +714,12 @@ class Bot:
             finish(f"Menunggu RSI {SIGNAL_TF} re-arm ke {self.cfg.rearm:g}")
             return
         if not armed:
-            finish(f"Belum ada RSI {SIGNAL_TF} di bawah oversold {self.cfg.oversold:g} pada lookback")
+            finish(f"Belum ada RSI {SIGNAL_TF} di bawah oversold {self.cfg.oversold:g} pada lookback "
+                   f"(candle {mode_txt})")
             return
         if not crossed:
-            finish(f"Belum ada crossing RSI {SIGNAL_TF} ke atas trigger {self.cfg.trigger:g}")
+            finish(f"Belum ada crossing RSI {SIGNAL_TF} ke atas trigger {self.cfg.trigger:g} "
+                   f"(candle {mode_txt})")
             return
         if now - st["last_trade_ts"] < self.cfg.lockout * 60:
             finish("Menunggu re-entry lockout")
@@ -712,7 +734,7 @@ class Bot:
             return
 
         price = self.price(symbol)
-        atr = atr_pct(candles, current_price=price)
+        atr = atr_pct(series, current_price=price)
         tp_pct = round(min(self.cfg.tp_max, max(self.cfg.tp_min, (atr or 0) * self.cfg.tp_atr)), 2)
         quote_free = self.broker.quote_free()
         equity = quote_free
