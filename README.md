@@ -262,6 +262,8 @@ Arti konfigurasi:
 
 Untuk testnet, gunakan API key testnet, bukan API key akun live. Untuk live, gunakan API key akun live yang memiliki izin trading Spot.
 
+Ketika `DRY_RUN=true`, bot tidak mengirimkan API key/secret ke exchange sama sekali (endpoint publik tidak memerlukannya). Ini mencegah startup gagal karena key kedaluwarsa, whitelist IP salah, atau key testnet yang dipasang saat `BINANCE_TESTNET=false` — ccxt memanggil endpoint signed di dalam `load_markets()` bila kredensial diisi, dan kegagalan autentikasi di titik itu menghentikan bot sebelum satu candle pun dievaluasi.
+
 > Jangan pernah mengunggah file `.env` ke GitHub, membagikan API secret, atau mengaktifkan izin withdrawal. Pastikan file `.env` tidak ikut di-commit ke repository.
 
 ### 2. Pair dan quote asset

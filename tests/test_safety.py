@@ -243,6 +243,22 @@ def test_update_portfolio_dry_run_writes_dashboard_snapshot(tmp_path, monkeypatc
     assert snapshot["realized_tracking_since"] is not None
 
 
+def test_exchange_credentials_never_sent_in_dry_run(monkeypatch):
+    """DRY RUN harus bebas kredensial: key invalid pernah menggagalkan load_markets() di VPS."""
+    from types import SimpleNamespace
+
+    from bot import exchange_credentials
+
+    dry = SimpleNamespace(dry_run=True, key="k", secret="s")
+    assert exchange_credentials(dry) == {"apiKey": None, "secret": None}
+
+    live = SimpleNamespace(dry_run=False, key="k", secret="s")
+    assert exchange_credentials(live) == {"apiKey": "k", "secret": "s"}
+
+    live_empty = SimpleNamespace(dry_run=False, key="", secret="")
+    assert exchange_credentials(live_empty) == {"apiKey": None, "secret": None}
+
+
 def test_config_defaults_match_documented_env(monkeypatch):
     monkeypatch.setenv("SYMBOLS", "BTC/USDT")
     for name in ("RSI_OVERSOLD", "RSI_TRIGGER", "ARM_LOOKBACK", "REARM_LEVEL", "POSITION_PCT",

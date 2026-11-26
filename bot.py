@@ -878,6 +878,19 @@ class Bot:
         self.persist("shutdown")
 
 
+def exchange_credentials(cfg: Config) -> dict:
+    """Kredensial ccxt. DRY RUN tidak memakai API key sama sekali.
+
+    Endpoint publik tidak memerlukan kredensial, dan ccxt memanggil endpoint SIGNED
+    (mis. sapi/v1/capital/config/getall) di dalam load_markets() ketika apiKey diisi.
+    Key yang kedaluwarsa/whitelist IP salah karena itu bisa menggagalkan startup bot
+    simulasi dengan AuthenticationError sebelum satu pun candle dievaluasi.
+    """
+    if cfg.dry_run:
+        return {"apiKey": None, "secret": None}
+    return {"apiKey": cfg.key or None, "secret": cfg.secret or None}
+
+
 def state_mode(cfg: Config) -> str:
     return "dry" if cfg.dry_run else ("testnet" if cfg.testnet else "live")
 
@@ -951,7 +964,7 @@ def main() -> int:
         log.warning("Telegram tidak dikonfigurasi (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID kosong); "
                     "notifikasi start/stop/trade dinonaktifkan")
 
-    ex = ccxt.binance({"apiKey": cfg.key or None, "secret": cfg.secret or None,
+    ex = ccxt.binance({**exchange_credentials(cfg),
                        "enableRateLimit": True, "timeout": 20000,
                        "options": {"defaultType": "spot", "adjustForTimeDifference": True}})
     try:
