@@ -701,8 +701,10 @@ class Bot:
         values = rsi_series([c[4] for c in series], self.cfg.period)
         prev, last = values[-2], values[-1]
 
-        # Histori dashboard hanya dari candle tertutup (grafik stabil); nilai berjalan
-        # dilaporkan terpisah di diagnostics.rsi agar gate entry dan tabel tetap sinkron.
+        # Histori dashboard: candle tertutup + titik candle berjalan (penanda `live`) supaya
+        # grafik bergerak; nilai berjalan juga dilaporkan di diagnostics.rsi. ATR di bawah
+        # (baris `atr_pct`) memakai `series` = candle tertutup + candle berjalan, dengan
+        # `current_price` = harga ticker sebagai harga referensi.
         history = st.setdefault("rsi_history", {})
         live_point = (series[-1][0], last) if live is not None and last is not None else None
         update_rsi_history(history, SIGNAL_TF, candles, self.cfg.period, now_ms, live=live_point)
