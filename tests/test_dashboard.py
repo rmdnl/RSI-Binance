@@ -165,3 +165,79 @@ def test_page_documents_live_history_point_and_refresh_setting():
     assert "HISTORY_REFRESH_SECONDS" in dashboard.PAGE
     assert "candle 1 jam yang sedang berjalan" in dashboard.PAGE
     assert "titik sebelumnya adalah candle tertutup" in dashboard.PAGE
+
+def test_static_file_rejects_path_traversal():
+    """Regresi C1: tanpa containment, /static/../.env membocorkan kredensial."""
+    assert dashboard.static_file("react.min.js") is not None
+    assert dashboard.static_file("../README.md") is None
+    assert dashboard.static_file("../../.env") is None
+    assert dashboard.static_file("/etc/passwd") is None
+    assert dashboard.static_file("") is None
+    assert dashboard.static_file("..") is None
+    assert dashboard.static_file("react.min.js?v=1") is not None, "query string tidak boleh memblokir"
+
+
+def test_static_file_does_not_escape_via_symlink_like_name():
+    assert dashboard.static_file("....//....//.env") is None
+    assert dashboard.static_file("..%2f.env") is None
+
+
+def test_http_server_refuses_traversal_over_raw_request():
+    """Klien HTTP mentah (tanpa normalisasi `..`) harus ditolak server, bukan browser."""
+    import socket
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def raw_get(path):
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+            sock.sendall(("GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").encode())
+            data = b""
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        head, _, body = data.partition(b"\r\n\r\n")
+        return head.split(b"\r\n")[0].decode(), body
+
+    try:
+        status_ok, body_ok = raw_get("/static/react.min.js")
+        assert "200" in status_ok and len(body_ok) > 1000
+
+        for path in ("/static/../README.md", "/static/../../.env", "/static/../../../../etc/passwd"):
+            status_bad, body_bad = raw_get(path)
+            assert "404" in status_bad, path + " harus 404, dapat " + status_bad
+            assert b"BINANCE_API_KEY" not in body_bad
+            assert b"root:x:0:0" not in body_bad
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_status_payload_exposes_state_file_and_staleness(monkeypatch):
+    import time
+
+    fresh = {"updated_at": time.time() - 5}
+    old = {"updated_at": time.time() - 3600}
+
+    payload = dashboard.status_payload(_state({"BTC/USDT": {"diagnostics": _diag(50.0)}}) | {"portfolio_snapshot": fresh})
+    assert payload["state_file"] == dashboard.STATE_FILE
+    assert payload["stale"] is False
+    assert payload["state_age_seconds"] >= 0
+
+    payload = dashboard.status_payload(_state({"BTC/USDT": {"diagnostics": _diag(50.0)}}) | {"portfolio_snapshot": old})
+    assert payload["stale"] is True
+    assert payload["state_age_seconds"] > 1000
+
+    payload = dashboard.status_payload(_state({"BTC/USDT": {"diagnostics": _diag(50.0)}}))
+    assert payload["stale"] is False and payload["state_age_seconds"] is None
+
+
+def test_page_warns_when_snapshot_is_stale():
+    assert "SNAPSHOT BASI" in dashboard.PAGE
+    assert "d.state_file" in dashboard.PAGE

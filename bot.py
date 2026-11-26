@@ -27,6 +27,11 @@ TF_MS = {SIGNAL_TF: 3_600_000}
 # Jumlah candle 1 jam yang diminta tiap evaluasi: cukup untuk Wilder RSI(RSI_PERIOD) +
 # ARM_LOOKBACK, dengan margin besar agar nilai RSI sudah stabil.
 KLINE_LIMIT = 1000
+# Histori minimum sebelum sinyal dipercaya. RSI Wilder adalah filter rekursif: seed rata-rata
+# 14 delta pertama masih berpengaruh setelah puluhan candle. Diukur pada data 1h nyata, galat RSI
+# terhadap nilai konvergen mencapai 14,08 poin pada 32 candle, 4,52 pada 50, dan < 0,01 pada 200.
+# Tanpa ambang ini, pair yang baru listing beberapa hari bisa memberi sinyal dari RSI mentah.
+RSI_WARMUP = 200
 TERMINAL = {"closed", "canceled", "cancelled", "expired", "rejected"}
 # Jumlah kegagalan save() beruntun sebelum alert Telegram dikirim. Visibilitas saja:
 # bot tetap berjalan dengan state di memori, perilaku trading tidak diubah.
@@ -697,7 +702,17 @@ class Bot:
                 return
         raw = self.ex.fetch_ohlcv(symbol, SIGNAL_TF, limit=KLINE_LIMIT)
         candles = closed(raw, tf_ms, now_ms)
-        if len(candles) < self.cfg.period + self.cfg.arm + 2:
+        minimum = max(RSI_WARMUP, self.cfg.period + self.cfg.arm + 2)
+        if len(candles) < minimum:
+            # Catat waktu evaluasi agar klines tidak diminta tiap loop, dan jelaskan penyebabnya
+            # di diagnostics supaya dashboard tidak tampak "bot diam".
+            st["last_eval_at"] = now
+            diag = st.setdefault("diagnostics", {})
+            if isinstance(diag, dict):
+                diag["evaluated_at"] = now
+                diag["reason"] = (f"Histori candle {SIGNAL_TF} belum cukup untuk RSI Wilder stabil "
+                                  f"({len(candles)}/{minimum} candle)")
+            self.save()
             return
         live = None
         if not self.cfg.use_closed_candles and raw and raw[-1][0] + tf_ms > now_ms \

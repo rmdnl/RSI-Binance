@@ -108,9 +108,9 @@ def test_scan_entry_records_diagnostics_and_rsi_history():
 
     now = 1_800_000_000.0
     now_ms = int(now * 1000)
-    start = now_ms - 80 * 3_600_000
+    start = now_ms - 220 * 3_600_000
     candles = [[start + index * 3_600_000, 100 + index, 100 + index, 100 + index, 100 + index, 1]
-               for index in range(80)]
+               for index in range(220)]
 
     class Exchange:
         def fetch_ohlcv(self, symbol, timeframe, limit):
@@ -553,3 +553,46 @@ def test_save_state_file_mode_is_600_on_posix(tmp_path):
     bot.save()  # save kedua lewat os.replace tidak boleh mengembalikan 0644
 
     assert os_mod.stat(state_file).st_mode & 0o777 == 0o600
+
+def test_scan_entry_waits_for_rsi_warmup_history():
+    """Regresi M1: RSI Wilder belum stabil pada histori pendek, jadi jangan bersinyal."""
+    from types import SimpleNamespace
+
+    from bot import RSI_WARMUP, Bot, new_symbol_state
+
+    now = 1_800_000_000.0
+    now_ms = int(now * 1000)
+    start = now_ms - 120 * 3_600_000
+    candles = [[start + index * 3_600_000, 100.0, 100.0, 100.0, 100.0, 1]
+               for index in range(120)]
+    panggilan = []
+
+    class Exchange:
+        def fetch_ohlcv(self, symbol, timeframe, limit):
+            panggilan.append(symbol)
+            return candles
+
+    symbol_state = new_symbol_state()
+    state = {"symbols": {"BTC/USDT": symbol_state}}
+    config = SimpleNamespace(period=14, arm=12, trigger=32, oversold=18, rearm=50, lockout=120,
+                             window_hours=24, max_entries=2, max_open=3,
+                             use_closed_candles=False, eval_seconds=60.0, history_refresh_seconds=5.0)
+    bot = Bot(config, Exchange(), None, None, state)
+    bot.save = lambda: None
+
+    bot.scan_entry("BTC/USDT", symbol_state, now)
+
+    assert RSI_WARMUP >= 200, "ambang histori harus >= 200 candle"
+    assert symbol_state["position"] is None
+    assert "belum cukup" in symbol_state["diagnostics"]["reason"]
+    assert str(RSI_WARMUP) in symbol_state["diagnostics"]["reason"]
+    assert symbol_state["last_eval_at"] == now, "waktu evaluasi harus dicatat agar tidak memanggil klines tiap loop"
+
+    bot.scan_entry("BTC/USDT", symbol_state, now + 1)  # masih dalam EVAL_SECONDS
+    assert len(panggilan) == 1, "tidak boleh meminta klines lagi sebelum EVAL_SECONDS"
+
+
+def test_rsi_warmup_constant_matches_documented_value():
+    from bot import RSI_WARMUP
+
+    assert RSI_WARMUP == 200

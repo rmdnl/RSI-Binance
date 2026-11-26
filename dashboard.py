@@ -4,10 +4,46 @@ import json, math, os, time
 from pathlib import Path
 from typing import Any, TypeGuard
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# .env adalah sumber tunggal STATE_FILE: bot dan dashboard harus membaca state yang sama.
+# load_dotenv tidak menimpa variabel yang sudah ada, jadi Environment= dari unit systemd tetap
+# menang bila operator memang ingin override.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _ENV_FILE = Path(__file__).resolve().parent / ".env"
+    if _ENV_FILE.exists():
+        _load_dotenv(_ENV_FILE)
+except Exception:  # pragma: no cover - dotenv opsional
+    pass
+
 HOST=os.getenv("DASHBOARD_HOST","127.0.0.1");PORT=int(os.getenv("DASHBOARD_PORT","8060"));STATE_FILE=os.getenv("STATE_FILE","state.json")
+STALE_AFTER = float(os.getenv("DASHBOARD_STALE_SECONDS", "120"))
 STATIC_DIR = Path(__file__).parent / "static"
 RSI_TF_COLORS = {"1h": "#fbbf24"}
 RSI_PAIR_DASHES = ["", "6 3", "2 3", "8 3 2 3"]
+
+NUL = chr(0)
+
+
+def static_file(relative: str) -> Path | None:
+    """Path file statis yang aman, atau None bila di luar STATIC_DIR.
+
+    Tanpa containment, `GET /static/../.env` membaca file apa pun yang bisa dibaca proses
+    dashboard (kredensial API, /etc/passwd). Browser menormalkan `..`, tetapi klien HTTP mentah
+    tidak, jadi pemeriksaan harus di sisi server.
+    """
+    relative = relative.split("?", 1)[0].split("#", 1)[0]
+    if not relative or NUL in relative:
+        return None
+    base = STATIC_DIR.resolve()
+    try:
+        candidate = (base / relative).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if candidate == base or not candidate.is_relative_to(base) or not candidate.is_file():
+        return None
+    return candidate
+
 
 def _fallback_oversold() -> float:
     """Default parameter oversold di sisi dashboard, dipakai hanya bila state belum memuatnya."""
@@ -68,9 +104,18 @@ def rsi_oversold_alerts(state, fallback=None):
 def status_payload(state):
     """Bentuk respons /api/status, termasuk alert RSI 1h di bawah oversold."""
     threshold, source = oversold_threshold(state)
+    portfolio = state.get("portfolio_snapshot")
+    age = None
+    if isinstance(portfolio, dict) and _number(portfolio.get("updated_at")):
+        age = max(0.0, time.time() - float(portfolio["updated_at"]))
     return {
         "mode": state.get("bot_mode", "unknown"),
-        "portfolio": state.get("portfolio_snapshot"),
+        "portfolio": portfolio,
+        # Operator harus bisa melihat state file mana yang dibaca dan apakah datanya basi:
+        # dashboard yang menampilkan mode/angka dari state lain adalah kegagalan senyap.
+        "state_file": STATE_FILE,
+        "state_age_seconds": age,
+        "stale": bool(age is not None and age > STALE_AFTER),
         "realized_tracking_since": state.get("realized_tracking_since"),
         "symbols": [{"symbol": symbol, "status": item.get("status", "unknown"),
                      "diagnostics": item.get("diagnostics"), "rsi_history": item.get("rsi_history", {})}
@@ -118,7 +163,7 @@ function renderRsiChart(d){
  lines.forEach(line=>children.push(create(R.Line,{key:line.key,type:'monotone',dataKey:line.key,name:line.name,stroke:line.stroke,strokeDasharray:line.dash||undefined,strokeWidth:2,dot:false,connectNulls:true,isAnimationActive:false})));
  ReactDOM.render(create(R.ResponsiveContainer,{width:'100%',height:'100%'},create(R.LineChart,{data,margin:{top:16,right:24,left:0,bottom:8}},...children)),mount);
 }
-async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();if(!r.ok)throw Error(d.error||r.status);const p=d.portfolio;if(!p){document.querySelector('#meta').textContent='Belum ada snapshot; pastikan bot aktif.';return}const age=Math.max(0,Date.now()/1000-p.updated_at);document.querySelector('#meta').textContent=`Mode ${safe(p.mode)} · quote ${safe(p.quote)} · snapshot ${new Date(p.updated_at*1000).toLocaleString()} (${Math.round(age)}s) · ${safe(p.valuation)}`;
+async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});const d=await r.json();if(!r.ok)throw Error(d.error||r.status);const p=d.portfolio;if(!p){document.querySelector('#meta').textContent='Belum ada snapshot; pastikan bot aktif.';return}const age=Math.max(0,Date.now()/1000-p.updated_at);document.querySelector('#meta').textContent=`Mode ${safe(p.mode)} · quote ${safe(p.quote)} · snapshot ${new Date(p.updated_at*1000).toLocaleString()} (${Math.round(age)}s) · ${safe(p.valuation)} · state ${safe(d.state_file||'?')}`+(d.stale?(' · ⚠ SNAPSHOT BASI '+Math.round(d.state_age_seconds||0)+'s, periksa STATE_FILE/dashboard'):'');
 const alerts=d.alerts||[],alertSet=new Set(alerts.map(a=>a.symbol));let out="";if(alerts.length){out+="<section><div class=\"card alert-card\"><h2 class=\"warn\">Alert: RSI 1h di bawah oversold "+fmt(d.oversold,2)+"</h2><table><thead><tr><th>Pair</th><th>RSI 1h</th><th>Oversold</th><th>Candle 1h</th><th>Status gate bot</th></tr></thead><tbody>"+alerts.map(a=>"<tr><td>"+safe(a.symbol)+"</td><td class=\"warn\">"+fmt(a.rsi,2)+"</td><td>"+fmt(a.oversold,2)+"</td><td>"+(a.candle_ts?new Date(a.candle_ts).toLocaleString():"—")+(a.candle_live?" (berjalan)":" (tertutup)")+"</td><td>"+(a.armed?"lookback oversold terpenuhi, menunggu cross-up"+(a.trigger==null?"":" ke "+fmt(a.trigger,2)):"belum ada cross-up trigger")+"</td></tr>").join("")+"</tbody></table><p class=\"muted\">Ambang = "+(d.oversold_source==="state"?"RSI_OVERSOLD yang dilaporkan bot di state":"default dashboard DASHBOARD_RSI_OVERSOLD karena state belum memuat parameter bot")+" · hanya pemberitahuan, tidak mengirim order.</p></div></section>"}out+='<div class="grid">'+cards.map((x,i)=>`<div class="card"><div class="muted">${x[0]}</div><div class="value ${i===1?(p.unrealized_pnl>=0?'pos':'neg'):i===2?(p.realized_pnl>=0?'pos':'neg'):''}">${x[1]}</div></div>`).join('')+'</div>';
 const symbolRows=(d.symbols||[]).map(x=>{const z=x.diagnostics||{};return `<tr><td>${safe(x.symbol)}</td><td>${safe(x.status)}</td><td class="${alertSet.has(x.symbol)?'warn':''}">${fmt(z.rsi,2)}</td><td>${z.candle_live===true?'berjalan':(z.candle_live===false?'tertutup':'—')}</td><td>${z.candle_ts?new Date(z.candle_ts).toLocaleString():'Belum dievaluasi'}</td><td>${safe(z.reason||'Menunggu evaluasi candle 1h')}</td></tr>`}).join('');
 out+='<section><h2>Tren RSI 24 Jam</h2><div class="card"><p class="muted">Pilih pair aktif untuk menampilkan tren RSI 1h 24 jam terakhir; titik terakhir adalah candle 1 jam yang sedang berjalan dan nilainya diperbarui setiap <code>HISTORY_REFRESH_SECONDS</code> detik (belum final sampai candle itu close). Bila lebih dari satu pair dipilih, pola garis putus-putus membedakan pair.</p><div id="rsi-pair-picks" class="pair-picks"></div><div id="rsi-chart" class="chart-wrap"></div></div></section>';
@@ -138,7 +183,12 @@ class Handler(BaseHTTPRequestHandler):
  def do_GET(self):
   # Serve static files
   if self.path.startswith("/static/"):
-    file_path = STATIC_DIR / self.path[len("/static/"):]
+    file_path = static_file(self.path[len("/static/"):])
+    if file_path is None:
+      body = b"not found"; status = 404; ctype = "text/plain"
+      self.send_response(status); self.send_header("Content-Type", ctype)
+      self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(body)))
+      self.end_headers(); self.wfile.write(body); return
     try:
       with open(file_path, "rb") as f:
         body = f.read()

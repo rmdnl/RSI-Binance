@@ -18,7 +18,8 @@ WorkingDirectory=/home/ubuntu/RSI-Binance
 Environment=PYTHONUNBUFFERED=1
 Environment=DASHBOARD_HOST=127.0.0.1
 Environment=DASHBOARD_PORT=8060
-Environment=STATE_FILE=/home/ubuntu/RSI-Binance/state.json
+# STATE_FILE tidak di-hardcode: dashboard membaca .env (sumber yang sama dengan bot).
+# Override lewat Environment=STATE_FILE=... hanya bila memang diperlukan.
 ExecStart=/home/ubuntu/RSI-Binance/venv/bin/python /home/ubuntu/RSI-Binance/dashboard.py
 Restart=always
 RestartSec=5

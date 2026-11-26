@@ -407,6 +407,10 @@ Titik candle berjalan di grafik hanya bisa diperbarui saat loop mencapai pemerik
 
 Setiap evaluasi RSI meminta satu kali klines 1 jam sebanyak `KLINE_LIMIT = 1000` candle (konstanta di `bot.py`, bukan variabel `.env`). Syarat minimum perhitungan jauh lebih kecil — `RSI_PERIOD` + `ARM_LOOKBACK` + 2 = 32 candle — sehingga 1000 candle hanya berfungsi memberi margin agar Wilder smoothing sudah stabil dan `rsi_history` dashboard punya cukup titik. Memperbesarnya menambah ukuran respons dan weight request tanpa mengubah aturan sinyal; kurangi hanya bila Anda juga memperkecil `ARM_LOOKBACK` dan sudah memverifikasi RSI tetap stabil (tes `test_kline_limit_is_1000` mengunci nilainya).
 
+### Histori minimum sebelum sinyal dipercaya (RSI_WARMUP)
+
+RSI Wilder bersifat rekursif: nilai 14 delta pertama (seed) masih memengaruhi hasil setelah puluhan candle. Diukur pada data 1 jam nyata, galat RSI terhadap nilai konvergen adalah **14,08 poin pada 32 candle**, 4,52 pada 50, dan di bawah 0,01 pada 200. Karena itu bot tidak mengevaluasi sinyal sebelum tersedia `RSI_WARMUP` = **200** candle 1 jam tertutup (atau `RSI_PERIOD + ARM_LOOKBACK + 2`, mana yang lebih besar), dan menulis alasan `Histori candle 1h belum cukup...` ke diagnostics. Praktisnya ini hanya terasa pada pair yang baru listing; `KLINE_LIMIT=1000` membuat pair lama selalu memenuhi syarat.
+
 ## Menjalankan bot
 
 Jalankan perintah dari direktori repository dengan virtual environment aktif.
@@ -554,6 +558,10 @@ Pastikan dashboard dan bot menggunakan file `STATE_FILE` yang sama dan dijalanka
 
 ### 5. Akses dashboard VPS dari komputer lokal
 
+Dashboard membaca `STATE_FILE` dari `.env` yang sama dengan bot, jadi bot dan dashboard selalu menunjuk file state yang sama (Environment= pada unit systemd tetap menang bila operator ingin override). Status bar menampilkan nama file state serta peringatan `SNAPSHOT BASI` bila umur snapshot melebihi `DASHBOARD_STALE_SECONDS` (default 120 detik) — tanda bahwa yang dilihat bukan data bot yang sedang berjalan.
+
+Endpoint `/static/` dibatasi pada direktori `static/`: permintaan seperti `/static/../.env` ditolak `404`, karena tanpa pemeriksaan itu dashboard read-only bisa dipakai membaca file apa pun yang bisa diakses prosesnya (kredensial API, `/etc/passwd`).
+
 Default dashboard hanya bind ke localhost VPS. Gunakan SSH tunnel agar dashboard dapat dibuka dengan aman dari komputer pribadi:
 
 ```bash
@@ -666,6 +674,27 @@ Setelah kondisi exchange dan state cocok, lakukan rekonsiliasi secara hati-hati.
 ### OCO terisi sebagian
 
 Jika salah satu leg OCO hanya terisi sebagian, bot tidak mengurangi kuantitas posisi dan tidak melepas referensi OCO. Pair ditandai `reconciliation` dan berhenti diproses sampai kondisi exchange dicocokkan manual. Alasan: sisa kuantitas leg OCO dapat masih aktif di exchange, sehingga mengurangi posisi secara lokal berisiko menjual kuantitas yang sama dua kali.
+
+### Pemulihan state rekonsiliasi
+
+Pair berstatus `reconciliation` tidak diproses lagi sampai state diperbaiki manual; bot tidak punya jalur pemulihan otomatis, dan itu disengaja. Urutan yang aman:
+
+1. `sudo -n systemctl stop rsi-binance.service` agar tidak ada penulisan state selama diperiksa.
+2. Periksa kebenaran di Binance untuk pair tersebut: open orders, order history, trade history, saldo `base` dan `quote`.
+3. Bandingkan dengan `state.json`/`state.testnet.json`: field `position.qty`, `position.cost`, `position.oco` (`tp_id`, `sl_id`), `position.oco_pending`, `pending_order`, `reconciliation_required` (per pair) dan `diagnostics.reason`.
+4. Sesuaikan **hanya** field yang sudah terbukti di exchange:
+
+| Kondisi exchange | Tindakan pada state |
+|---|---|
+| Tidak ada posisi dan tidak ada order | `position=null`, `pending_order=null`, `reconciliation_required=false`, `status="idle"` |
+| Posisi utuh, tidak ada order proteksi | pertahankan `position`, `position.oco=null`, `oco_pending=false`, `reconciliation_required=false`, `status="in_position"` (bot akan memasang OCO baru pada siklus berikutnya) |
+| Sebagian posisi sudah terjual | kecilkan `position.qty` ke saldo base aktual dan sesuaikan `position.cost` proporsional, lalu perlakuan seperti baris di atas |
+| Masih ada order terbuka | **jangan** dilepas; batalkan dulu di Binance atau biarkan, dan biarkan `reconciliation_required=true` |
+
+5. `status="cooldown"` + `cooldown_until` bila ingin menahan entry beberapa saat setelah pemulihan.
+6. Simpan, lalu `sudo -n systemctl start rsi-binance.service` dan periksa `journalctl` serta kolom Status di dashboard.
+
+Jangan menghapus `pending_order` atau `reconciliation_required` hanya agar bot kembali trading: penanda itu satu-satunya bukti bahwa ada order yang pernah ambigu di exchange.
 
 ### Saat bot restart atau berhenti
 
@@ -827,7 +856,7 @@ Jalankan dari direktori repository dengan virtual environment aktif:
 pytest -q
 ```
 
-Unit test yang tersedia (`tests/test_safety.py` 24 kasus, `tests/test_backtest.py` 10 kasus, `tests/test_notifier.py` 13 kasus, `tests/test_dashboard.py` 19 kasus; total 66 kasus) mencakup:
+Unit test yang tersedia (`tests/test_safety.py` 28 kasus, `tests/test_backtest.py` 10 kasus, `tests/test_notifier.py` 13 kasus, `tests/test_dashboard.py` 24 kasus; total 75 kasus) mencakup:
 
 - RSI pada data yang naik monotonis bernilai 100.
 - RSI pada data flat bernilai 100 (regresi sentinel lama `50`).
@@ -843,6 +872,9 @@ Unit test yang tersedia (`tests/test_safety.py` 24 kasus, `tests/test_backtest.p
 - `refresh_live_history` memperbarui titik berjalan memakai cache candle tertutup + harga ticker tanpa satu pun request klines tambahan, menghormati `HISTORY_REFRESH_SECONDS`, dan tidak berjalan pada mode `SIGNAL_USE_CLOSED=true` atau sebelum ada evaluasi pertama.
 - Jejak `diagnostics.rsi_live`/`rsi_live_at` bertahan saat `scan_entry` menulis ulang blok `diagnostics` pada evaluasi berikutnya.
 - Halaman dashboard menyebut `HISTORY_REFRESH_SECONDS` dan menjelaskan bahwa titik terakhir grafik adalah candle 1 jam berjalan.
+- `static_file` menolak path di luar `static/` (`../README.md`, `../../.env`, path absolut), dan server HTTP sungguhan menolak permintaan mentah `/static/../.env` serta `/static/../../../../etc/passwd` dengan `404` tanpa membocorkan isinya.
+- `status_payload` menyertakan `state_file`, `state_age_seconds`, dan `stale` (snapshot lebih tua dari `DASHBOARD_STALE_SECONDS`), dan halaman menampilkan peringatan `SNAPSHOT BASI`.
+- `scan_entry` tidak menghasilkan sinyal sebelum `RSI_WARMUP` candle 1 jam tersedia, menulis alasannya ke diagnostics, dan mencatat `last_eval_at` agar klines tidak diminta setiap loop.
 - `scan_entry` hanya meminta candle 1h, menulis `diagnostics` (`rsi`, `rsi_previous`, `timeframe`) dan `rsi_history["1h"]` saat pair belum memenuhi syarat entry, termasuk parameter efektif `oversold` dan `trigger` yang dipakai dashboard untuk menghitung alert.
 - `new_state` membuang histori timeframe lama (mis. `15m`/`4h`) dari state yang dibuat versi sebelumnya.
 - `update_portfolio` menulis snapshot dashboard lengkap pada mode dry run (equity, unrealized/realized PnL, posisi, saldo).
