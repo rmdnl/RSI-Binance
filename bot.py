@@ -715,6 +715,11 @@ class Bot:
                 "oversold": self.cfg.oversold, "trigger": self.cfg.trigger,
                 "oversold_seen": False, "trigger_cross": False,
                 "reason": f"Menunggu evaluasi candle {SIGNAL_TF}"}
+        # Nilai refresh histori (rsi_live/rsi_live_at) ditulis di antara dua evaluasi; jangan
+        # sampai hilang saat scan_entry menulis ulang blok diagnostics.
+        previous_diag = st.get("diagnostics") or {}
+        diag["rsi_live"] = previous_diag.get("rsi_live")
+        diag["rsi_live_at"] = previous_diag.get("rsi_live_at")
         st["diagnostics"] = diag
 
         def finish(reason: str):

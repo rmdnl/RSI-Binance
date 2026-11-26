@@ -364,6 +364,10 @@ def test_refresh_live_history_updates_running_point_without_klines():
     bot.refresh_live_history("BTC/USDT", st, now + 7)  # < HISTORY_REFRESH_SECONDS
     assert st["rsi_history"]["1h"][-1]["value"] == value_after_refresh
 
+    # evaluasi berikutnya tidak boleh menghapus jejak refresh histori
+    bot.scan_entry("BTC/USDT", st, now + cfg.eval_seconds + 1)
+    assert st["diagnostics"].get("rsi_live_at") == now + 5
+
     closed_bot = Bot(_realtime_cfg(use_closed_candles=True), exchange, None, None, state)
     closed_bot.save = lambda: None
     before = len(ticker_calls)
