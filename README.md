@@ -401,6 +401,8 @@ LOG_FILE=bot.log
 
 Loop berjalan setiap `LOOP_SECONDS`, tetapi evaluasi RSI per pair dibatasi `EVAL_SECONDS` (default 60 detik), jadi request klines tetap terkendali walau loop dipercepat. Jangan menurunkan `EVAL_SECONDS` tanpa alasan karena request yang terlalu sering dapat meningkatkan penggunaan API.
 
+Titik candle berjalan di grafik hanya bisa diperbarui saat loop mencapai pemeriksaan berikutnya, jadi agar `HISTORY_REFRESH_SECONDS=5` benar-benar berarti, set `LOOP_SECONDS` ≤ 5 (VPS memakai `LOOP_SECONDS=5`, `EVAL_SECONDS=60`). Refresh itu memakai endpoint ticker (weight kecil) dan tidak menambah request klines, jadi penggunaan API tetap aman; gate entry tetap sepenuhnya dikendalikan `EVAL_SECONDS`.
+
 ### Histori candle per evaluasi (KLINE_LIMIT)
 
 Setiap evaluasi RSI meminta satu kali klines 1 jam sebanyak `KLINE_LIMIT = 1000` candle (konstanta di `bot.py`, bukan variabel `.env`). Syarat minimum perhitungan jauh lebih kecil — `RSI_PERIOD` + `ARM_LOOKBACK` + 2 = 32 candle — sehingga 1000 candle hanya berfungsi memberi margin agar Wilder smoothing sudah stabil dan `rsi_history` dashboard punya cukup titik. Memperbesarnya menambah ukuran respons dan weight request tanpa mengubah aturan sinyal; kurangi hanya bila Anda juga memperkecil `ARM_LOOKBACK` dan sudah memverifikasi RSI tetap stabil (tes `test_kline_limit_is_1000` mengunci nilainya).
@@ -724,7 +726,7 @@ Mekanisme tersebut tidak menjamin bebas dari rate-limit atau IP ban. Binance dap
 Rekomendasi:
 
 1. Jalankan satu instance bot untuk satu state/account.
-2. Jangan memperkecil `LOOP_SECONDS` tanpa kebutuhan.
+2. Jangan memperkecil `LOOP_SECONDS` tanpa kebutuhan. Mempercepat loop menambah request ticker per menit; pada `LOOP_SECONDS=5` dua pair berarti ~24 request ticker/menit (weight 1) — masih jauh di bawah batas publik.
 3. Hindari beberapa proses yang melakukan private REST request dari IP sama.
 4. Pantau log dan status rate-limit.
 5. Jangan melakukan retry manual berulang ketika status order belum jelas.
