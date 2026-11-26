@@ -707,6 +707,12 @@ Untuk API key live:
 - Jangan membagikan file `.env`.
 - Jangan mengunggah state atau log yang berisi informasi sensitif ke repository publik.
 
+### Izin file state
+
+File state memuat saldo, posisi, dan penanda order, jadi bot menulisnya dengan izin `0600`. `save()` menulis ke `<state>.tmp`, menyetel izin file sementara itu ke `0600` melalui `os.chmod`, baru kemudian memindahkannya dengan `os.replace`; menyetel izin setelah `replace` tidak berguna karena setiap `save()` berikutnya (tiap `LOOP_SECONDS`) membuat file baru dari file sementara bermode default. Konsekuensinya `chmod 600` manual pada file state akan hilang pada save berikutnya jika kode belum diperbaiki — perbaiki di `save()`, bukan di host. Di Windows `os.chmod` hanya mengatur bit read-only, sehingga pengujian mode POSIX dilewati (`skip`) di platform itu.
+
+`.gitignore` mengabaikan `state.json*`, `state*.json`, dan `state*.json.*`, sehingga state sekunder seperti `state.testnet.json` beserta file `.lock`-nya tidak ikut ter-commit. Verifikasi dengan `git check-ignore -v state.testnet.json`.
+
 ### Pengendalian request
 
 Bot menggunakan beberapa mekanisme untuk mengurangi tekanan API:

@@ -507,3 +507,49 @@ def test_partial_oco_fill_fails_closed(tmp_path, monkeypatch):
     assert symbol_state["position"]["qty"] == 0.01
     assert symbol_state["position"]["oco"] is not None
     assert any("fill parsial" in event["message"] for event in state["events"])
+
+def test_save_restricts_state_permissions_before_replace(tmp_path, monkeypatch):
+    """State memuat saldo/posisi/order: file pengganti tidak boleh mewarisi 0644."""
+    import os as os_mod
+
+    from bot import Bot, new_symbol_state
+
+    state_file = str(tmp_path / "state.testnet.json")
+    state = {"symbols": {"BTC/USDT": new_symbol_state()}, "paper_quote": 1000.0}
+    cfg = _realtime_cfg()
+    cfg.state_file = state_file
+    bot = Bot(cfg, object(), None, None, state)
+
+    dipanggil = []
+    asli = os_mod.chmod
+
+    def chmod_spy(path, mode):
+        dipanggil.append((path, mode))
+        return asli(path, mode)
+
+    monkeypatch.setattr("bot.os.chmod", chmod_spy)
+    bot.save()
+
+    assert dipanggil == [(state_file + ".tmp", 0o600)],         "chmod 0600 harus terjadi pada file sementara sebelum os.replace"
+    assert os_mod.path.exists(state_file)
+
+
+def test_save_state_file_mode_is_600_on_posix(tmp_path):
+    import os as os_mod
+    import sys as sys_mod
+
+    import pytest as pytest_mod
+
+    if sys_mod.platform == "win32":
+        pytest_mod.skip("mode POSIX tidak berlaku di Windows")
+
+    from bot import Bot, new_symbol_state
+
+    state_file = str(tmp_path / "state.testnet.json")
+    cfg = _realtime_cfg()
+    cfg.state_file = state_file
+    bot = Bot(cfg, object(), None, None, {"symbols": {"BTC/USDT": new_symbol_state()}})
+    bot.save()
+    bot.save()  # save kedua lewat os.replace tidak boleh mengembalikan 0644
+
+    assert os_mod.stat(state_file).st_mode & 0o777 == 0o600

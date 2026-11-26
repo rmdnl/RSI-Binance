@@ -413,6 +413,15 @@ class Bot:
         tmp = self.cfg.state_file + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.state, f, indent=2, allow_nan=False)
+        # State memuat saldo, posisi, dan penanda order. File sementara dibuat dengan mode
+        # default proses (biasanya 0644) lalu dipindahkan lewat os.replace, sehingga file
+        # pengganti mewarisi 0644 dan chmod manual pada state akan hilang pada save berikutnya.
+        # Batasi izin SEBELUM replace, jangan sesudahnya. Di Windows ini hanya mengatur bit
+        # read-only dan tidak berpengaruh buruk.
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError as exc:
+            log.warning("Gagal menyetel izin state %s: %s", tmp, exc)
         os.replace(tmp, self.cfg.state_file)
 
     def persist(self, context: str = "loop") -> bool:

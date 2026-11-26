@@ -9,6 +9,8 @@
 
 # State runtime dan artefak bot
 state.json*
+state*.json
+state*.json.*
 *.state.json
 *.log
 
