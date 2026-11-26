@@ -21,7 +21,9 @@ from dotenv import load_dotenv
 from filelock import FileLock
 
 log = logging.getLogger("bot")
-TF_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
+# Strategi HANYA memakai satu timeframe: RSI 1 jam pada candle tertutup.
+SIGNAL_TF = "1h"
+TF_MS = {SIGNAL_TF: 3_600_000}
 TERMINAL = {"closed", "canceled", "cancelled", "expired", "rejected"}
 # Jumlah kegagalan save() beruntun sebelum alert Telegram dikirim. Visibilitas saja:
 # bot tetap berjalan dengan state di memori, perilaku trading tidak diubah.
@@ -72,11 +74,8 @@ class Config:
     period: int
     oversold: float
     trigger: float
-    max4: float
-    max1: float
     arm: int
     rearm: float
-    context_closed: bool
     position_pct: float
     max_open: int
     tp_min: float
@@ -102,10 +101,9 @@ class Config:
         cfg = cls(
             env("BINANCE_API_KEY"), env("BINANCE_API_SECRET"), boolean("BINANCE_TESTNET", False), boolean("DRY_RUN", True),
             env("QUOTE_ASSET", "USDT").upper(), symbols,
-            finite_int("RSI_PERIOD", 14, 2, 200), finite_float("RSI_OVERSOLD", 25, 0, 100),
-            finite_float("RSI_TRIGGER", 32, 0, 100), finite_float("RSI_4H_MAX", 35, 0, 100),
-            finite_float("RSI_1H_MAX", 35, 0, 100), finite_int("ARM_LOOKBACK", 12, 1, 500),
-            finite_float("REARM_LEVEL", 50, 0, 100), boolean("CONTEXT_USE_CLOSED", False),
+            finite_int("RSI_PERIOD", 14, 2, 200), finite_float("RSI_OVERSOLD", 18, 0, 100),
+            finite_float("RSI_TRIGGER", 32, 0, 100), finite_int("ARM_LOOKBACK", 12, 1, 500),
+            finite_float("REARM_LEVEL", 50, 0, 100),
             finite_float("POSITION_PCT", 30, 0.0001, 100), finite_int("MAX_OPEN_POSITIONS", 3, 1, 100),
             finite_float("TP_MIN_PCT", 1, 0.0001, 100), finite_float("TP_MAX_PCT", 3, 0.0001, 100),
             finite_float("TP_ATR_MULT", 1.5, 0, 100), finite_float("SL_PCT", 2, 0.0001, 100),
@@ -156,26 +154,6 @@ def rsi_series(closes: list[float], period: int = 14) -> list[Optional[float]]:
 
 def closed(candles: list[list], tf_ms: int, now_ms: int) -> list[list]:
     return [c for c in candles if int(c[0]) + tf_ms <= now_ms]
-
-
-def aggregate_candles(candles: list[list], tf_ms: int) -> list[list]:
-    """Gabungkan candle (mis. 15m) menjadi timeframe lebih besar yang selaras epoch.
-
-    Bucket terakhir yang belum penuh ikut disertakan; pemanggil menyaring candle
-    yang belum tertutup dengan `closed()` sehingga tidak ada data parsial terpakai.
-    """
-    out: list[list] = []
-    for candle in candles:
-        bucket = int(candle[0]) // tf_ms * tf_ms
-        if out and out[-1][0] == bucket:
-            row = out[-1]
-            row[2] = max(row[2], float(candle[2]))
-            row[3] = min(row[3], float(candle[3]))
-            row[4] = float(candle[4])
-            row[5] = float(row[5]) + float(candle[5])
-        else:
-            out.append([bucket, float(candle[1]), float(candle[2]), float(candle[3]), float(candle[4]), float(candle[5])])
-    return out
 
 
 def atr_pct(candles: list[list], period: int = 14, current_price: Optional[float] = None) -> Optional[float]:
@@ -665,22 +643,14 @@ class Bot:
             return
         self.record_exit(symbol, st, reason, result, now)
 
-    def context_rsi(self, c4raw: list[list], c1raw: list[list], now_ms: int):
-        """Return the HTF RSI values used by entry logic, based on one configured context mode."""
-        c4 = closed(c4raw, TF_MS["4h"], now_ms) if self.cfg.context_closed else c4raw
-        c1 = closed(c1raw, TF_MS["1h"], now_ms) if self.cfg.context_closed else c1raw
-        r4 = rsi_series([c[4] for c in c4], self.cfg.period)
-        r1 = rsi_series([c[4] for c in c1], self.cfg.period)
-        r4_value = r4[-1] if r4 and r4[-1] is not None else None
-        r1_value = r1[-1] if r1 and r1[-1] is not None else None
-        return r4_value, r1_value
-
     def scan_entry(self, symbol: str, st: dict, now: float):
+        """Entry hanya dari RSI 1h: arming < oversold lalu cross-up trigger pada candle tertutup."""
         now_ms = int(now * 1000)
-        expected_open = now_ms // TF_MS["15m"] * TF_MS["15m"] - TF_MS["15m"]
+        tf_ms = TF_MS[SIGNAL_TF]
+        expected_open = now_ms // tf_ms * tf_ms - tf_ms
         if st["last_eval_ts"] >= expected_open:
             return
-        candles = closed(self.ex.fetch_ohlcv(symbol, "15m", limit=500), TF_MS["15m"], now_ms)
+        candles = closed(self.ex.fetch_ohlcv(symbol, SIGNAL_TF, limit=500), tf_ms, now_ms)
         if len(candles) < self.cfg.period + self.cfg.arm + 2:
             return
         if candles[-1][0] <= st["last_eval_ts"]:
@@ -689,25 +659,17 @@ class Bot:
         values = rsi_series([c[4] for c in candles], self.cfg.period)
         prev, last = values[-2], values[-1]
 
-        # Histori + diagnostik dashboard. 1h/4h diagregasi dari candle 15m yang sudah
-        # tertutup, jadi tidak menambah request API pada setiap evaluasi.
+        # Histori + diagnostik dashboard: hanya RSI 1h dari candle tertutup, jadi tidak ada
+        # data parsial dan tidak ada request timeframe tambahan di luar sinyal itu sendiri.
         history = st.setdefault("rsi_history", {})
-        update_rsi_history(history, "15m", candles, self.cfg.period, now_ms)
-        c1_closed = closed(aggregate_candles(candles, TF_MS["1h"]), TF_MS["1h"], now_ms)
-        c4_closed = closed(aggregate_candles(candles, TF_MS["4h"]), TF_MS["4h"], now_ms)
-        update_rsi_history(history, "1h", c1_closed, self.cfg.period, now_ms)
-        update_rsi_history(history, "4h", c4_closed, self.cfg.period, now_ms)
-        r1_chart = rsi_series([c[4] for c in c1_closed], self.cfg.period)
-        r4_chart = rsi_series([c[4] for c in c4_closed], self.cfg.period)
-        diag = {"evaluated_at": now, "candle_ts": candles[-1][0],
-                "rsi_15m_previous": prev, "rsi_15m": last,
+        update_rsi_history(history, SIGNAL_TF, candles, self.cfg.period, now_ms)
+        diag = {"evaluated_at": now, "candle_ts": candles[-1][0], "timeframe": SIGNAL_TF,
+                "rsi_previous": prev, "rsi": last,
                 # Parameter efektif ikut disimpan agar dashboard bisa menghitung alert
                 # oversold dari sumber yang sama dengan gate entry bot.
                 "oversold": self.cfg.oversold, "trigger": self.cfg.trigger,
-                "rsi_1h": r1_chart[-1] if r1_chart and r1_chart[-1] is not None else None,
-                "rsi_4h": r4_chart[-1] if r4_chart and r4_chart[-1] is not None else None,
                 "oversold_seen": False, "trigger_cross": False,
-                "reason": "Menunggu evaluasi candle 15m"}
+                "reason": f"Menunggu evaluasi candle {SIGNAL_TF}"}
         st["diagnostics"] = diag
 
         def finish(reason: str):
@@ -715,7 +677,7 @@ class Bot:
             self.save()
 
         if prev is None or last is None:
-            finish("Data candle 15m belum cukup untuk menghitung RSI")
+            finish(f"Data candle {SIGNAL_TF} belum cukup untuk menghitung RSI")
             return
 
         if st["need_reset"]:
@@ -729,13 +691,13 @@ class Bot:
         diag["oversold_seen"] = armed
         diag["trigger_cross"] = crossed
         if st["need_reset"]:
-            finish(f"Menunggu RSI 15m re-arm ke {self.cfg.rearm:g}")
+            finish(f"Menunggu RSI {SIGNAL_TF} re-arm ke {self.cfg.rearm:g}")
             return
         if not armed:
-            finish(f"Belum ada RSI 15m di bawah oversold {self.cfg.oversold:g} pada lookback")
+            finish(f"Belum ada RSI {SIGNAL_TF} di bawah oversold {self.cfg.oversold:g} pada lookback")
             return
         if not crossed:
-            finish(f"Belum ada crossing RSI 15m ke atas trigger {self.cfg.trigger:g}")
+            finish(f"Belum ada crossing RSI {SIGNAL_TF} ke atas trigger {self.cfg.trigger:g}")
             return
         if now - st["last_trade_ts"] < self.cfg.lockout * 60:
             finish("Menunggu re-entry lockout")
@@ -749,20 +711,8 @@ class Bot:
             finish("Batas posisi terbuka sudah tercapai")
             return
 
-        c4raw = self.ex.fetch_ohlcv(symbol, "4h", limit=300)
-        c1raw = self.ex.fetch_ohlcv(symbol, "1h", limit=300)
-        r4, r1 = self.context_rsi(c4raw, c1raw, now_ms)
-        if r4 is None or r1 is None:
-            finish("Data candle belum cukup untuk RSI konteks 1h/4h")
-            return
-        diag["rsi_1h_context"] = r1
-        diag["rsi_4h_context"] = r4
-        if not (r4 < self.cfg.max4 and r1 < self.cfg.max1):
-            finish(f"Filter konteks gagal: RSI 4h harus < {self.cfg.max4:g} dan RSI 1h harus < {self.cfg.max1:g}")
-            return
-
         price = self.price(symbol)
-        atr = atr_pct(closed(c1raw, TF_MS["1h"], now_ms), current_price=price)
+        atr = atr_pct(candles, current_price=price)
         tp_pct = round(min(self.cfg.tp_max, max(self.cfg.tp_min, (atr or 0) * self.cfg.tp_atr)), 2)
         quote_free = self.broker.quote_free()
         equity = quote_free
@@ -955,6 +905,11 @@ def new_state(path: str, cfg: Config) -> dict:
     for symbol in cfg.symbols:
         base = new_symbol_state()
         base.update(state["symbols"].get(symbol, {}))
+        # Buang histori timeframe yang tidak lagi dipakai strategi (mis. 15m/4h dari versi lama).
+        history = base.get("rsi_history")
+        if isinstance(history, dict):
+            for tf in [key for key in history if key not in TF_MS]:
+                history.pop(tf, None)
         state["symbols"][symbol] = base
     return state
 

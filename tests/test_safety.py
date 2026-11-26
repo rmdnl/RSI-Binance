@@ -86,26 +86,13 @@ def test_update_rsi_history_keeps_persisted_rows_inside_window():
     from bot import update_rsi_history
 
     now_ms = 1_800_000_000_000
-    tf_ms = 900_000
-    history = {"15m": [{"timestamp": now_ms - 2 * tf_ms, "value": 41.5},
-                       {"timestamp": now_ms - 40 * 60 * 60 * 1000, "value": 9.9}]}
+    tf_ms = 3_600_000
+    history = {"1h": [{"timestamp": now_ms - 2 * tf_ms, "value": 41.5},
+                      {"timestamp": now_ms - 40 * 60 * 60 * 1000, "value": 9.9}]}
 
-    rows = update_rsi_history(history, "15m", [], 14, now_ms)
+    rows = update_rsi_history(history, "1h", [], 14, now_ms)
 
     assert rows == [{"timestamp": now_ms - 2 * tf_ms, "value": 41.5}]
-
-
-def test_aggregate_candles_builds_higher_timeframe_ohlcv():
-    from bot import aggregate_candles
-
-    tf15 = 900_000
-    start = 1_800_000_000_000 // tf15 * tf15
-    candles = [[start + index * tf15, 10 + index, 12 + index, 9 + index, 11 + index, 1] for index in range(4)]
-
-    hours = aggregate_candles(candles, 3_600_000)
-
-    assert len(hours) == 1
-    assert hours[0] == [start, 10.0, 15.0, 9.0, 14.0, 4.0]
 
 
 def test_scan_entry_records_diagnostics_and_rsi_history():
@@ -115,21 +102,19 @@ def test_scan_entry_records_diagnostics_and_rsi_history():
 
     now = 1_800_000_000.0
     now_ms = int(now * 1000)
-    start = now_ms - 80 * 900_000
-    candles = [[start + index * 900_000, 100 + index, 100 + index, 100 + index, 100 + index, 1] for index in range(80)]
+    start = now_ms - 80 * 3_600_000
+    candles = [[start + index * 3_600_000, 100 + index, 100 + index, 100 + index, 100 + index, 1]
+               for index in range(80)]
 
     class Exchange:
         def fetch_ohlcv(self, symbol, timeframe, limit):
             assert symbol == "BTC/USDT"
-            if timeframe == "15m":
-                return candles
-            if timeframe in ("1h", "4h"):
-                return []
-            raise AssertionError(f"Unexpected timeframe: {timeframe}")
+            assert timeframe == "1h", "strategi hanya boleh meminta candle 1h"
+            return candles
 
     symbol_state = new_symbol_state()
     state = {"symbols": {"BTC/USDT": symbol_state}}
-    config = SimpleNamespace(period=14, arm=12, trigger=32, oversold=25, rearm=50, lockout=120,
+    config = SimpleNamespace(period=14, arm=12, trigger=32, oversold=18, rearm=50, lockout=120,
                              window_hours=24, max_entries=2, max_open=3)
     bot = Bot(config, Exchange(), None, None, state)
     bot.save = lambda: None
@@ -137,18 +122,91 @@ def test_scan_entry_records_diagnostics_and_rsi_history():
     bot.scan_entry("BTC/USDT", symbol_state, now)
 
     diagnostic = symbol_state["diagnostics"]
-    assert diagnostic["rsi_15m"] == 100.0
-    assert diagnostic["rsi_1h"] == 100.0
-    assert diagnostic["rsi_4h"] is None
+    assert diagnostic["timeframe"] == "1h"
+    assert diagnostic["rsi"] == 100.0
+    assert diagnostic["rsi_previous"] == 100.0
     assert diagnostic["candle_ts"] == candles[-1][0]
     assert diagnostic["oversold_seen"] is False
     assert diagnostic["trigger_cross"] is False
-    assert diagnostic["oversold"] == 25
+    assert diagnostic["oversold"] == 18
     assert diagnostic["trigger"] == 32
-    assert "Belum ada RSI 15m" in diagnostic["reason"]
-    assert symbol_state["rsi_history"]["15m"]
+    assert "Belum ada RSI 1h" in diagnostic["reason"]
+    assert set(symbol_state["rsi_history"]) == {"1h"}
     assert symbol_state["rsi_history"]["1h"]
-    assert "4h" in symbol_state["rsi_history"]
+
+
+def test_new_state_drops_legacy_timeframe_history(tmp_path, monkeypatch):
+    """State lama menyimpan histori 15m/4h; setelah upgrade hanya 1h yang boleh tersisa."""
+    import json
+
+    from bot import Config, new_state
+
+    monkeypatch.setenv("SYMBOLS", "BTC/USDT")
+    monkeypatch.setenv("DRY_RUN", "true")
+    state_path = tmp_path / "state.json"
+    monkeypatch.setenv("STATE_FILE", str(state_path))
+    legacy = {"bot_mode": "dry", "symbols": {"BTC/USDT": {
+        "rsi_history": {"15m": [{"timestamp": 1, "value": 10.0}],
+                        "1h": [{"timestamp": 2, "value": 20.0}],
+                        "4h": [{"timestamp": 3, "value": 30.0}]}}}}
+    state_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    state = new_state(str(state_path), Config.from_env())
+
+    assert set(state["symbols"]["BTC/USDT"]["rsi_history"]) == {"1h"}
+
+
+def test_scan_entry_rsi_1h_cross_opens_paper_position():
+    """Jalur entry penuh setelah migrasi ke RSI 1h: arming < 18 lalu cross-up > 32 -> BUY kertas."""
+    from types import SimpleNamespace
+
+    from bot import Bot, Notifier, PaperBroker, new_symbol_state
+
+    closes = [60000.0]
+    for _ in range(300):
+        closes.append(closes[-1] * (1 - 0.004))
+    for _ in range(2):
+        closes.append(closes[-1] * (1 + 0.02))
+    n = len(closes)
+    tf = 3_600_000
+    now_ms = 1_800_000_000_000
+    start = now_ms - n * tf
+    candles = [[start + i * tf, c, c * 1.001, c * 0.999, c, 1.0] for i, c in enumerate(closes)]
+    now = now_ms / 1000
+
+    class Exchange:
+        def fetch_ohlcv(self, symbol, timeframe, limit):
+            assert timeframe == "1h"
+            return candles
+
+        def fetch_ticker(self, symbol):
+            return {"last": closes[-1]}
+
+        def market(self, symbol):
+            return {"limits": {"cost": {"min": 5.0}}}
+
+    state = {"symbols": {"BTC/USDT": new_symbol_state()}, "paper_quote": 1000.0}
+    cfg = SimpleNamespace(period=14, arm=12, trigger=32.0, oversold=18.0, rearm=50.0, lockout=120.0,
+                          window_hours=24.0, max_entries=2, max_open=3, position_pct=30.0,
+                          tp_min=1.0, tp_max=3.0, tp_atr=1.5, sl_pct=2.0, dry_run=True,
+                          use_oco=False, cooldown=240.0, quote="USDT", paper_fee=0.1)
+    symbol_state = state["symbols"]["BTC/USDT"]
+    bot = Bot(cfg, Exchange(), PaperBroker(state, cfg.paper_fee), Notifier("", ""), state)
+    bot.save = lambda: None
+    bot.persist = lambda *a, **k: None
+
+    bot.scan_entry("BTC/USDT", symbol_state, now)
+
+    assert symbol_state["diagnostics"]["trigger_cross"] is True
+    assert symbol_state["diagnostics"]["oversold_seen"] is True
+    assert symbol_state["status"] == "in_position"
+    assert symbol_state["pending_order"] is None
+    position = symbol_state["position"]
+    assert position["entry"] == closes[-1]
+    assert position["sl"] == closes[-1] * (1 - 0.02)
+    assert 1.0 <= position["tp_pct"] <= 3.0
+    assert state["paper_quote"] == 700.0
+    assert "BUY berhasil dibuka" in symbol_state["diagnostics"]["reason"]
 
 
 def test_update_portfolio_dry_run_writes_dashboard_snapshot(tmp_path, monkeypatch):
@@ -195,7 +253,7 @@ def test_config_defaults_match_documented_env(monkeypatch):
 
     cfg = Config.from_env()
 
-    assert (cfg.oversold, cfg.trigger, cfg.arm, cfg.rearm) == (25, 32, 12, 50)
+    assert (cfg.oversold, cfg.trigger, cfg.arm, cfg.rearm) == (18, 32, 12, 50)
     assert (cfg.tp_min, cfg.tp_max, cfg.tp_atr, cfg.sl_pct) == (1.0, 3.0, 1.5, 2.0)
     assert (cfg.cooldown, cfg.lockout, cfg.max_entries, cfg.window_hours) == (240.0, 120.0, 2, 24.0)
     assert (cfg.position_pct, cfg.max_open, cfg.paper_fee, cfg.dry_balance) == (30.0, 3, 0.1, 1000.0)

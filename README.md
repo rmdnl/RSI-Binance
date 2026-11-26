@@ -1,6 +1,6 @@
 # RSI-Binance
 
-Bot trading **Binance Spot multi-pair** berbasis konfirmasi RSI 15 menit dengan konteks RSI 1 jam dan 4 jam. Repository ini menyediakan mode simulasi (DRY RUN/paper), Binance Spot Testnet, live trading, backtest, dashboard read-only, notifikasi Telegram opsional, serta penyimpanan state untuk pemulihan setelah restart.
+Bot trading **Binance Spot multi-pair** berbasis konfirmasi RSI 1 jam (satu timeframe, tanpa konteks 15 menit/4 jam). Repository ini menyediakan mode simulasi (DRY RUN/paper), Binance Spot Testnet, live trading, backtest, dashboard read-only, notifikasi Telegram opsional, serta penyimpanan state untuk pemulihan setelah restart.
 
 > [!WARNING]
 > Trading aset kripto memiliki risiko tinggi dan dapat menyebabkan kehilangan seluruh modal. Software ini bukan nasihat keuangan dan tidak menjamin keuntungan. **Mulai dari DRY RUN, lanjutkan ke Testnet, dan jangan gunakan live trading sebelum memahami seluruh risiko serta memverifikasi perilaku bot.**
@@ -28,9 +28,9 @@ Bot trading **Binance Spot multi-pair** berbasis konfirmasi RSI 15 menit dengan 
 
 ## Fitur
 
-- Strategi RSI multi-timeframe untuk Binance Spot.
-- Evaluasi sinyal entry hanya pada candle 15 menit yang sudah tertutup.
-- Konteks RSI 1 jam dan 4 jam.
+- Strategi RSI satu timeframe untuk Binance Spot.
+- Evaluasi sinyal entry hanya pada candle 1 jam yang sudah tertutup.
+- Tidak memakai timeframe 15 menit, 4 jam, maupun filter konteks HTF.
 - RSI menggunakan metode Wilder/RMA.
 - Position sizing berdasarkan persentase equity.
 - Take profit dinamis berdasarkan ATR 1 jam, dengan batas minimum dan maksimum.
@@ -42,7 +42,7 @@ Bot trading **Binance Spot multi-pair** berbasis konfirmasi RSI 15 menit dengan 
 - Pemantauan TP/SL oleh bot sebagai fallback ketika OCO tidak digunakan.
 - Penyimpanan state atomik untuk pemulihan setelah restart.
 - Estimasi realized PnL, unrealized PnL, dan portfolio.
-- Dashboard read-only dengan refresh otomatis setiap 5 detik, diagnostik RSI per pair, dan alert ketika RSI 15m berada di bawah parameter oversold.
+- Dashboard read-only dengan refresh otomatis setiap 5 detik, diagnostik RSI per pair, dan alert ketika RSI 1h berada di bawah parameter oversold.
 - Log aplikasi dan notifikasi Telegram opsional.
 - Cache harga, throttling request, serta penanganan kondisi order yang hasilnya belum pasti.
 
@@ -50,26 +50,24 @@ Bot trading **Binance Spot multi-pair** berbasis konfirmasi RSI 15 menit dengan 
 
 ### Sinyal entry
 
-Sinyal entry diproses ketika candle 15 menit baru selesai. Secara umum, kondisi yang diperiksa adalah:
+Sinyal entry diproses sekali per candle 1 jam, setelah candle tersebut tertutup. Secara umum, kondisi yang diperiksa adalah:
 
-1. RSI 15 menit sebelumnya berada pada atau di bawah `RSI_TRIGGER`.
-2. RSI 15 menit terbaru menembus ke atas `RSI_TRIGGER`.
-3. Dalam sejumlah candle sebelumnya, RSI pernah berada di bawah `RSI_OVERSOLD`.
-4. RSI 4 jam berada di bawah `RSI_4H_MAX`.
-5. RSI 1 jam berada di bawah `RSI_1H_MAX`.
-6. Pair tidak memiliki posisi aktif.
-7. Pair tidak sedang cooldown atau terkena lockout re-entry.
-8. Batas entry dalam jendela waktu belum tercapai.
-9. Syarat RSI re-arm terpenuhi jika reset post-trade masih aktif.
-10. Saldo quote mencukupi dan order memenuhi ketentuan minimum exchange.
-11. Jumlah posisi terbuka belum mencapai `MAX_OPEN_POSITIONS`.
+1. RSI 1 jam sebelumnya berada pada atau di bawah `RSI_TRIGGER`.
+2. RSI 1 jam terbaru menembus ke atas `RSI_TRIGGER`.
+3. Dalam `ARM_LOOKBACK` candle 1 jam sebelumnya, RSI pernah berada di bawah `RSI_OVERSOLD`.
+4. Pair tidak memiliki posisi aktif.
+5. Pair tidak sedang cooldown atau terkena lockout re-entry.
+6. Batas entry dalam jendela waktu belum tercapai.
+7. Syarat RSI re-arm terpenuhi jika reset post-trade masih aktif.
+8. Saldo quote mencukupi dan order memenuhi ketentuan minimum exchange.
+9. Jumlah posisi terbuka belum mencapai `MAX_OPEN_POSITIONS`.
 
 ### Take profit dan stop loss
 
 Take profit dihitung saat entry:
 
 ```text
-ATR TP (%) = ATR 1H (%) × TP_ATR_MULT
+ATR TP (%) = ATR 1 jam (%) × TP_ATR_MULT
 TP (%)     = clamp(ATR TP, TP_MIN_PCT, TP_MAX_PCT)
 TP price   = entry price × (1 + TP (%) / 100)
 SL price   = entry price × (1 - SL_PCT / 100)
@@ -318,27 +316,19 @@ Jika token terisi dan pesan uji sampai, tetapi notifikasi startup tetap tidak mu
 
 ```dotenv
 RSI_PERIOD=14
-RSI_4H_MAX=35
-RSI_1H_MAX=35
-RSI_OVERSOLD=25
+RSI_OVERSOLD=18
 RSI_TRIGGER=32
 ARM_LOOKBACK=12
-CONTEXT_USE_CLOSED=false
 ```
 
 | Variabel | Fungsi |
 |---|---|
 | `RSI_PERIOD` | Periode RSI Wilder/RMA |
-| `RSI_4H_MAX` | Batas maksimum RSI timeframe 4 jam |
-| `RSI_1H_MAX` | Batas maksimum RSI timeframe 1 jam |
-| `RSI_OVERSOLD` | Ambang oversold untuk proses arm sinyal |
-| `RSI_TRIGGER` | Level RSI 15 menit yang harus ditembus ke atas |
-| `ARM_LOOKBACK` | Jumlah candle 15 menit untuk mencari kondisi oversold sebelumnya |
-| `CONTEXT_USE_CLOSED` | Memilih candle berjalan atau candle tertutup untuk konteks 1H/4H |
+| `RSI_OVERSOLD` | Ambang oversold untuk proses arm sinyal (default `18`) |
+| `RSI_TRIGGER` | Level RSI 1 jam yang harus ditembus ke atas (default `32`) |
+| `ARM_LOOKBACK` | Jumlah candle 1 jam untuk mencari kondisi oversold sebelumnya (default `12` = 12 jam) |
 
-`CONTEXT_USE_CLOSED=false` menggunakan konteks candle 1H/4H yang sedang berjalan. Nilainya lebih responsif tetapi dapat berubah sebelum candle timeframe tersebut ditutup.
-
-`CONTEXT_USE_CLOSED=true` hanya menggunakan candle 1H/4H yang sudah tertutup. Pendekatan ini lebih konservatif dan sinyal dapat lebih jarang.
+Strategi hanya memakai RSI pada candle 1 jam yang sudah tertutup. Variabel `RSI_4H_MAX`, `RSI_1H_MAX`, dan `CONTEXT_USE_CLOSED` sudah dihapus; bila masih ada di `.env`, nilainya diabaikan dan tidak memengaruhi keputusan entry.
 
 ### 5. Ukuran posisi
 
@@ -381,7 +371,7 @@ ENTRY_WINDOW_HOURS=24
 
 - `COOLDOWN_MINUTES`: jeda pair setelah stop loss.
 - `REENTRY_LOCKOUT_MINUTES`: jeda minimum setelah transaksi sebelum entry baru.
-- `REARM_LEVEL`: RSI 15 menit harus pulih ke level ini sebelum sinyal berikutnya dapat diterima setelah transaksi.
+- `REARM_LEVEL`: RSI 1 jam harus pulih ke level ini sebelum sinyal berikutnya dapat diterima setelah transaksi.
 - `MAX_ENTRIES_PER_WINDOW`: maksimum entry per pair dalam jendela waktu.
 - `ENTRY_WINDOW_HOURS`: panjang jendela pembatasan entry.
 
@@ -397,7 +387,7 @@ LOG_FILE=bot.log
 - `STATE_FILE`: lokasi file penyimpanan state.
 - `LOG_FILE`: lokasi file log.
 
-Walaupun loop berjalan berkala, sinyal entry 15 menit hanya dievaluasi berdasarkan candle 15 menit yang sudah tertutup. Jangan menurunkan interval tanpa alasan karena request yang terlalu sering dapat meningkatkan penggunaan API.
+Walaupun loop berjalan berkala, sinyal entry hanya dievaluasi berdasarkan candle 1 jam yang sudah tertutup; request klines baru dilakukan setelah candle 1 jam berganti. Jangan menurunkan interval tanpa alasan karena request yang terlalu sering dapat meningkatkan penggunaan API.
 
 ## Menjalankan bot
 
@@ -512,8 +502,8 @@ Dashboard melakukan refresh otomatis setiap **5 detik**.
 Informasi yang ditampilkan:
 
 - Mode bot dan quote asset.
-- Diagnostik RSI per pair (RSI 15m/1h/4h, status, alasan gate entry) dan grafik interaktif tren RSI 15m/1h/4h selama 24 jam terakhir untuk pair yang dipilih. Warna garis menunjukkan timeframe (15m biru `#38bdf8`, 1h kuning `#fbbf24`, 4h ungu `#a78bfa`); bila lebih dari satu pair dipilih, pola garis putus-putus membedakan pair. Warna dan pola itu berasal dari konstanta `RSI_TF_COLORS` dan `RSI_PAIR_DASHES` di `dashboard.py`, jadi mengubahnya cukup di satu tempat. Histori memakai candle tertutup dan disimpan dalam state; RSI 1h/4h berasal dari agregasi candle 15m sehingga tidak menambah request API pada setiap evaluasi. Nilai agregasi memakai histori 15m yang tersedia, jadi dapat sedikit berbeda dari RSI 1h/4h exchange yang dipakai sebagai gate entry pada keputusan nyata.
-- **Alert oversold**: banner di bagian atas halaman berisi pair yang RSI 15m terkini berada di bawah parameter `RSI_OVERSOLD`, terurut dari yang paling oversold, dan baris pair terkait ditandai pada tabel diagnostik. Ambang diambil dari `diagnostics.oversold` yang dilaporkan bot di state, sehingga alert memakai parameter yang sama dengan gate entry; bila state belum memuatnya (state lama sebelum fitur ini), dashboard memakai default `25` atau `DASHBOARD_RSI_OVERSOLD` dan menandai sumbernya di banner. Perbandingan bersifat ketat: RSI tepat sama dengan ambang belum memicu alert. Alert hanya pemberitahuan — bot tetap membeli hanya setelah RSI 15m menembus ke atas `RSI_TRIGGER`.
+- Diagnostik RSI per pair (RSI 1h, status, alasan gate entry) dan grafik interaktif tren RSI 1h selama 24 jam terakhir untuk pair yang dipilih. Semua garis memakai warna 1 jam `#fbbf24`; bila lebih dari satu pair dipilih, pola garis putus-putus membedakan pair. Warna dan pola itu berasal dari konstanta `RSI_TF_COLORS` dan `RSI_PAIR_DASHES` di `dashboard.py`, jadi mengubahnya cukup di satu tempat. Histori memakai candle 1h tertutup yang sama dengan sumber sinyal bot dan disimpan dalam state, sehingga grafik, tabel diagnostik, dan gate entry selalu konsisten.
+- **Alert oversold**: banner di bagian atas halaman berisi pair yang RSI 1h terkini berada di bawah parameter `RSI_OVERSOLD`, terurut dari yang paling oversold, dan baris pair terkait ditandai pada tabel diagnostik. Ambang diambil dari `diagnostics.oversold` yang dilaporkan bot di state, sehingga alert memakai parameter yang sama dengan gate entry; bila state belum memuatnya (state lama sebelum fitur ini), dashboard memakai default `18` atau `DASHBOARD_RSI_OVERSOLD` dan menandai sumbernya di banner. Perbandingan bersifat ketat: RSI tepat sama dengan ambang belum memicu alert. Alert hanya pemberitahuan — bot tetap membeli hanya setelah RSI 1h menembus ke atas `RSI_TRIGGER`.
 - Equity estimasi beserta label valuasi (portofolio kertas pada dry run, mark-to-market pada live).
 - Unrealized PnL dan realized PnL.
 - Daftar posisi bot, kuantitas, entry, mark price, nilai, TP, dan SL.
@@ -532,7 +522,7 @@ Dashboard menggunakan environment variable berikut:
 | `DASHBOARD_HOST` | `127.0.0.1` | Alamat bind dashboard |
 | `DASHBOARD_PORT` | `8060` | Port dashboard |
 | `STATE_FILE` | `state.json` | File state yang dibaca |
-| `DASHBOARD_RSI_OVERSOLD` | `25` | Ambang oversold cadangan untuk alert, dipakai hanya bila state belum memuat `diagnostics.oversold` |
+| `DASHBOARD_RSI_OVERSOLD` | `18` | Ambang oversold cadangan untuk alert, dipakai hanya bila state belum memuat `diagnostics.oversold` |
 
 Dashboard tidak memuat file `.env` secara otomatis. Jika ingin mengubah konfigurasi dashboard, berikan environment variable pada proses saat dijalankan.
 
@@ -564,25 +554,22 @@ Jangan mengekspos port dashboard langsung ke internet. Dashboard tidak menyediak
 
 ## Menjalankan backtest
 
-Backtest menggunakan data historis candle 15 menit Binance. Data dapat diunduh dari endpoint publik, sehingga API key tidak diperlukan untuk pengunduhan data historis.
+Backtest menggunakan data historis candle 1 jam Binance. Data dapat diunduh dari endpoint publik, sehingga API key tidak diperlukan untuk pengunduhan data historis.
 
 Contoh:
 
 ```bash
-# Backtest default 90 hari
-python backtest.py --symbol NEARUSDT --days 90
+# Backtest default 365 hari dengan parameter bot (oversold 18, trigger 32)
+python backtest.py --symbol NEARUSDT --days 365
 
-# Backtest 180 hari dengan beberapa kombinasi RSI 4H/1H
-python backtest.py --symbol NEARUSDT --days 180 --combos 30/30,35/40,40/35,40/40
-
-# Gunakan konteks candle 1H/4H yang sudah tertutup
-python backtest.py --symbol NEARUSDT --days 180 --closed
+# Backtest 730 hari dengan parameter lain
+python backtest.py --symbol NEARUSDT --days 730 --oversold 18 --trigger 32 --lookback 12
 
 # Simpan data historis yang diunduh ke CSV
-python backtest.py --symbol NEARUSDT --days 90 --save-csv nearusdt_15m.csv
+python backtest.py --symbol NEARUSDT --days 365 --save-csv nearusdt_1h.csv
 
 # Ulangi backtest menggunakan CSV lokal
-python backtest.py --symbol NEARUSDT --days 90 --data-csv nearusdt_15m.csv
+python backtest.py --symbol NEARUSDT --days 365 --data-csv nearusdt_1h.csv
 ```
 
 ### Argument backtest
@@ -592,12 +579,10 @@ python backtest.py --symbol NEARUSDT --days 90 --data-csv nearusdt_15m.csv
 | `--symbol` | Pair dalam format simbol Binance, misalnya `NEARUSDT` |
 | `--days` | Jumlah hari periode pengujian |
 | `--warmup-days` | Data tambahan untuk pemanasan indikator |
-| `--combos` | Kombinasi batas RSI 4H/1H, format `30/30,35/40` |
-| `--closed` | Menggunakan konteks candle 1H/4H tertutup |
 | `--period` | Periode RSI |
-| `--oversold` | Ambang oversold (default `25`, sama dengan `RSI_OVERSOLD` di `env.example`) |
-| `--trigger` | Level trigger RSI 15m |
-| `--lookback` | Lookback candle untuk kondisi oversold |
+| `--oversold` | Ambang oversold (default `18`, sama dengan `RSI_OVERSOLD` di `env.example`) |
+| `--trigger` | Level trigger RSI 1 jam (default `32`) |
+| `--lookback` | Lookback candle 1 jam untuk kondisi oversold (default `12`) |
 | `--rearm` | Level RSI untuk re-arm |
 | `--pos` | Persentase equity per posisi |
 | `--tp-min`, `--tp-max` | Batas minimum dan maksimum TP |
@@ -612,9 +597,9 @@ python backtest.py --symbol NEARUSDT --days 90 --data-csv nearusdt_15m.csv
 | `--data-csv` | Membaca candle dari CSV lokal |
 | `--save-csv` | Menyimpan data hasil unduhan ke CSV |
 
-Pada tabel hasil, kolom `ditahan` menghitung sinyal yang lolos konteks RSI 4H/1H tetapi diblok aturan anti beli beruntun (cooldown setelah SL, lockout re-entry, batas entry per jendela, atau reset RSI belum pulih). Backtest akan mencetak peringatan bila data sebelum jendela uji kurang dari 200 candle, karena RSI awal belum stabil.
+Pada tabel hasil, kolom `ditahan` menghitung sinyal yang diblok aturan anti beli beruntun (cooldown setelah SL, lockout re-entry, batas entry per jendela, atau reset RSI belum pulih). Backtest akan mencetak peringatan bila data sebelum jendela uji kurang dari 200 candle, karena RSI awal belum stabil.
 
-Backtest bukan simulasi sempurna kondisi live. Entry diasumsikan pada close candle sinyal. Jika SL dan TP tersentuh dalam candle yang sama, SL dihitung lebih dahulu. ATR dinormalisasi terhadap close candle 1H terakhir, sedangkan bot memakai harga terkini. Max drawdown dihitung pada saat trade ditutup, bukan intratrade, sehingga nilainya lebih kecil dari drawdown real-time. Spread, market impact, latency, partial fill, downtime, dan seluruh kondisi kegagalan exchange tidak dimodelkan secara lengkap.
+Backtest bukan simulasi sempurna kondisi live. Entry diasumsikan pada close candle sinyal. Jika SL dan TP tersentuh dalam candle yang sama, SL dihitung lebih dahulu. ATR dihitung dari candle 1 jam dan dinormalisasi terhadap close candle 1 jam terakhir, sedangkan bot memakai harga terkini. Max drawdown dihitung pada saat trade ditutup, bukan intratrade, sehingga nilainya lebih kecil dari drawdown real-time. Spread, market impact, latency, partial fill, downtime, dan seluruh kondisi kegagalan exchange tidak dimodelkan secara lengkap.
 
 ## State, restart, dan rekonsiliasi
 
@@ -829,8 +814,8 @@ Unit test yang tersedia (`tests/test_safety.py` 16 kasus, `tests/test_backtest.p
 - `poll_oco` bersifat fail-closed (`unknown`) saat exchange error.
 - `Config.from_env` menolak nilai integer non-bulat.
 - `update_rsi_history` membuang sampel di luar window 24 jam namun tetap menyimpan sampel lama yang masih di dalam window.
-- `aggregate_candles` menggabungkan candle 15m menjadi 1h/4h dengan OHLCV yang benar.
-- `scan_entry` menulis `diagnostics` dan `rsi_history` (15m/1h/4h) saat pair belum memenuhi syarat entry, termasuk parameter efektif `oversold` dan `trigger` yang dipakai dashboard untuk menghitung alert.
+- `scan_entry` hanya meminta candle 1h, menulis `diagnostics` (`rsi`, `rsi_previous`, `timeframe`) dan `rsi_history["1h"]` saat pair belum memenuhi syarat entry, termasuk parameter efektif `oversold` dan `trigger` yang dipakai dashboard untuk menghitung alert.
+- `new_state` membuang histori timeframe lama (mis. `15m`/`4h`) dari state yang dibuat versi sebelumnya.
 - `update_portfolio` menulis snapshot dashboard lengkap pada mode dry run (equity, unrealized/realized PnL, posisi, saldo).
 - Nilai default `Config.from_env` sama dengan nilai di `env.example`.
 - `reconcile_startup` pada mode dry run membersihkan pending order yang tertinggal.
@@ -912,11 +897,11 @@ Pastikan proses bot masih aktif dan snapshot portfolio sudah tersedia. Dashboard
 
 ### Alert oversold muncul tetapi bot tidak membeli
 
-Alert dashboard hanya menandai RSI 15m di bawah `RSI_OVERSOLD`. Entry bot masih memerlukan seluruh gate lain: RSI 15m harus menembus ke atas `RSI_TRIGGER`, nilai konteks RSI 1h/4h harus di bawah batasnya, serta lockout, batas entry per window, dan batas posisi terbuka harus terpenuhi. Pair tetap ditampilkan pada tabel diagnostik dengan alasan gate yang berlaku.
+Alert dashboard hanya menandai RSI 1h di bawah `RSI_OVERSOLD`. Entry bot masih memerlukan seluruh gate lain: RSI 1h harus menembus ke atas `RSI_TRIGGER`, serta lockout, batas entry per window, dan batas posisi terbuka harus terpenuhi. Pair tetap ditampilkan pada tabel diagnostik dengan alasan gate yang berlaku.
 
 ### Nilai oversold pada alert bukan `RSI_OVERSOLD` di `.env`
 
-Banner menandai sumber ambang. Sumber `parameter bot` berarti nilai diambil dari `diagnostics.oversold` di state. Sumber `default dashboard` berarti state belum memuat parameter tersebut (misalnya state lama sebelum fitur ini, atau pair belum pernah dievaluasi setelah upgrade); jalankan bot minimal satu kali evaluasi candle 15m, atau set `DASHBOARD_RSI_OVERSOLD` pada proses dashboard agar nilai cadangan sesuai.
+Banner menandai sumber ambang. Sumber `parameter bot` berarti nilai diambil dari `diagnostics.oversold` di state. Sumber `default dashboard` berarti state belum memuat parameter tersebut (misalnya state lama sebelum fitur ini, atau pair belum pernah dievaluasi setelah upgrade); jalankan bot minimal satu kali evaluasi candle 1 jam, atau set `DASHBOARD_RSI_OVERSOLD` pada proses dashboard agar nilai cadangan sesuai.
 
 ### Dashboard menjawab `not found` padahal service aktif
 
