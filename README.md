@@ -93,6 +93,8 @@ Jika hasil pemasangan atau eksekusi order tidak dapat dipastikan, bot menyimpan 
 - Akun dan API key Binance Spot Testnet untuk pengujian testnet.
 - Linux/VPS direkomendasikan untuk operasi 24 jam.
 
+Dependensi Python dipasang dari `requirements.txt`, dengan versi **terpin eksak** (`==`) ke build yang sudah lulus unit test dan verifikasi runtime. Rentang terbuka (`>=`) berbahaya di sini: `ccxt` cukup sering mengubah nama field order/balance, dan perubahan itu tidak tertangkap unit test yang memakai exchange palsu. Prosedur upgrade: naikkan satu pin, jalankan `pytest tests`, bandingkan hasil backtest pada data yang sama, baru deploy.
+
 Dependensi Python dipasang dari `requirements.txt`:
 
 - `ccxt`: koneksi exchange dan eksekusi order.
@@ -671,9 +673,20 @@ Periksa hal berikut langsung di Binance:
 
 Setelah kondisi exchange dan state cocok, lakukan rekonsiliasi secara hati-hati. Jangan menghapus pending intent hanya agar bot kembali trading.
 
-### OCO terisi sebagian
+### OCO terisi sebagian dan kuantitas leg
 
 Jika salah satu leg OCO hanya terisi sebagian, bot tidak mengurangi kuantitas posisi dan tidak melepas referensi OCO. Pair ditandai `reconciliation` dan berhenti diproses sampai kondisi exchange dicocokkan manual. Alasan: sisa kuantitas leg OCO dapat masih aktif di exchange, sehingga mengurangi posisi secara lokal berisiko menjual kuantitas yang sama dua kali.
+
+Polling OCO memeriksa **kedua leg** setiap siklus (bukan berhenti pada leg pertama yang masih terbuka) dan membandingkan `amount` tiap leg dengan `position.qty`. Empat kondisi berakhir di rekonsiliasi manual, bukan ditebak:
+
+| Status poll | Arti |
+|---|---|
+| `oversized` | `amount` leg lebih besar dari `position.qty` — leg itu bisa menjual melebihi saldo base |
+| `partial` | salah satu leg terisi sebagian, termasuk saat leg itu masih terbuka |
+| `conflict` | kedua leg terisi penuh — kuantitas terjual melebihi posisi dan PnL state tidak lagi lengkap |
+| `unknown` | galat API saat membaca status order |
+
+`arm_oco` juga menolak memasang OCO bila `position.qty` nol, karena OCO tanpa kuantitas tidak melindungi apa pun.
 
 ### Pemulihan state rekonsiliasi
 
@@ -716,7 +729,18 @@ Realized PnL dihitung dari hasil penjualan dikurangi bagian biaya posisi yang te
 
 Perhitungan tidak selalu mencakup transaksi manual, deposit, withdrawal, trade sebelum tracking dimulai, atau seluruh fee yang dibayar dalam aset lain.
 
-### Equity
+### Equity akun vs modal sizing
+
+Bot melaporkan dua angka yang **tidak boleh tertukar**:
+
+| Field `portfolio_snapshot` | Arti | Dipakai untuk |
+|---|---|---|
+| `equity` | mark-to-market **seluruh akun**: semua aset yang bisa dihargai, termasuk aset yang tidak pernah disentuh strategi | laporan/dashboard saja |
+| `tradable_equity` | `quote_free` + nilai mark posisi bot | dasar `POSITION_PCT` saat membuka posisi |
+
+Contoh testnet: akun berisi 182.067,77 USDT bebas plus aset drip yang tidak dipakai strategi, sehingga `equity` = 368.273,71 tetapi `tradable_equity` = 182.267,77 (termasuk posisi berjalan 200 USDT). `POSITION_PCT=30` berarti **54.680,33 USDT per entry**, bukan 110.482.
+
+Dashboard menampilkan keduanya sebagai kartu terpisah: `Equity akun`, `Modal sizing`, `Ukuran 1 posisi` (= `tradable_equity × POSITION_PCT`), dan `Quote bebas`.
 
 Equity merupakan estimasi nilai portfolio dalam quote asset berdasarkan harga market yang tersedia. Equity bukan saldo free yang dapat langsung digunakan untuk order atau withdrawal.
 
@@ -856,7 +880,7 @@ Jalankan dari direktori repository dengan virtual environment aktif:
 pytest -q
 ```
 
-Unit test yang tersedia (`tests/test_safety.py` 28 kasus, `tests/test_backtest.py` 10 kasus, `tests/test_notifier.py` 13 kasus, `tests/test_dashboard.py` 24 kasus; total 75 kasus) mencakup:
+Unit test yang tersedia (`tests/test_safety.py` 36 kasus, `tests/test_backtest.py` 10 kasus, `tests/test_notifier.py` 13 kasus, `tests/test_dashboard.py` 27 kasus; total 86 kasus) mencakup:
 
 - RSI pada data yang naik monotonis bernilai 100.
 - RSI pada data flat bernilai 100 (regresi sentinel lama `50`).
@@ -875,6 +899,11 @@ Unit test yang tersedia (`tests/test_safety.py` 28 kasus, `tests/test_backtest.p
 - `static_file` menolak path di luar `static/` (`../README.md`, `../../.env`, path absolut), dan server HTTP sungguhan menolak permintaan mentah `/static/../.env` serta `/static/../../../../etc/passwd` dengan `404` tanpa membocorkan isinya.
 - `status_payload` menyertakan `state_file`, `state_age_seconds`, dan `stale` (snapshot lebih tua dari `DASHBOARD_STALE_SECONDS`), dan halaman menampilkan peringatan `SNAPSHOT BASI`.
 - `scan_entry` tidak menghasilkan sinyal sebelum `RSI_WARMUP` candle 1 jam tersedia, menulis alasannya ke diagnostics, dan mencatat `last_eval_at` agar klines tidak diminta setiap loop.
+- `poll_oco` mengirim `position.qty` sebagai pembanding, menandai leg yang lebih besar dari posisi (`oversized`), fill parsial pada leg yang masih terbuka (`partial`), dan kedua leg terisi (`conflict`); `check_exit` mengunci pair ke `reconciliation` dan mempertahankan referensi OCO.
+- `arm_oco` menolak memasang OCO saat kuantitas posisi nol.
+- Snapshot portofolio memisahkan `equity` (seluruh akun) dari `tradable_equity` (quote bebas + posisi bot) dan `tradable_equity()` dipakai `scan_entry` untuk `POSITION_PCT`.
+- Halaman dashboard mendefinisikan `cards` sebelum dipakai, menampilkan `Equity akun`/`Modal sizing`/`Ukuran 1 posisi`, dan seluruh inline script lolos `node --check` (sintaks JS tervalidasi, bukan hanya string teks).
+- `requirements.txt` seluruhnya terpin eksak (`==`).
 - `scan_entry` hanya meminta candle 1h, menulis `diagnostics` (`rsi`, `rsi_previous`, `timeframe`) dan `rsi_history["1h"]` saat pair belum memenuhi syarat entry, termasuk parameter efektif `oversold` dan `trigger` yang dipakai dashboard untuk menghitung alert.
 - `new_state` membuang histori timeframe lama (mis. `15m`/`4h`) dari state yang dibuat versi sebelumnya.
 - `update_portfolio` menulis snapshot dashboard lengkap pada mode dry run (equity, unrealized/realized PnL, posisi, saldo).

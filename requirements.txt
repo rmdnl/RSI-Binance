@@ -1,5 +1,10 @@
-ccxt>=4.3.0
-requests>=2.31.0
-python-dotenv>=1.0.0
-pytest>=8.0.0
-filelock>=3.12
+# Versi terpin ke build yang sudah lulus seluruh unit test dan verifikasi runtime
+# (VPS Python 3.10.12, 2026-11-27). Rentang terbuka (>=) membuat deploy ulang bisa menarik
+# versi ccxt yang mengubah nama field order/balance tanpa ada tes yang menangkapnya.
+# Prosedur upgrade: naikkan satu pin, jalankan `pytest tests`, lalu bandingkan hasil backtest
+# pada data yang sama sebelum deploy.
+ccxt==4.5.93
+requests==2.34.2
+python-dotenv==1.2.4
+filelock==4.1.0
+pytest==9.2.0

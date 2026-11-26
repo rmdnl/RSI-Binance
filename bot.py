@@ -366,31 +366,67 @@ class LiveBroker:
         return {"list_id": str(result.get("orderListId") or ""), "client_list_id": client_id,
                 "tp_id": tp_id, "sl_id": sl_id}
 
-    def poll_oco(self, symbol, oco):
+    def _leg_proceeds(self, order, filled, avg):
+        proceeds = float(order.get("cost") or filled * avg)
+        for fee in order.get("fees") or ([order["fee"]] if order.get("fee") else []):
+            if fee and fee.get("currency") == self.quote:
+                proceeds -= float(fee.get("cost") or 0)
+        return proceeds
+
+    def poll_oco(self, symbol, oco, expected_qty=None):
+        """Status OCO, dengan leg yang relevan.
+
+        Status: "unknown" (galat API), "oversized" (leg > posisi), "conflict" (kedua leg
+        terisi), "partial" (leg terisi sebagian, termasuk yang masih terbuka), "filled",
+        "active", "gone_confirmed".
+
+        Kedua leg diperiksa setiap poll (bukan berhenti di leg pertama yang terbuka) dan
+        kuantitasnya dibandingkan dengan posisi: leg yang lebih besar dari posisi dapat
+        menjual melebihi saldo, dan fill parsial pada satu leg menyisakan leg lain dengan
+        kuantitas penuh. Keduanya harus berakhir di rekonsiliasi manual, bukan ditebak.
+        """
         try:
-            open_ids = {str(order["id"]) for order in self.ex.fetch_open_orders(symbol)}
-            legs = []
+            open_orders = {str(order["id"]): order for order in self.ex.fetch_open_orders(symbol)}
+            expected = float(expected_qty) if expected_qty else None
+            filled_legs, open_legs, partials, oversized = [], [], [], []
             for name, order_id in (("TP", oco["tp_id"]), ("SL", oco["sl_id"])):
-                if str(order_id) in open_ids:
-                    return "active", None
-                order = self.ex.fetch_order(str(order_id), symbol)
+                order = open_orders.get(str(order_id))
+                is_open = order is not None
+                if order is None:
+                    order = self.ex.fetch_order(str(order_id), symbol)
                 status = str(order.get("status") or "").lower()
                 filled = float(order.get("filled") or 0)
                 amount = float(order.get("amount") or 0)
-                if status not in TERMINAL:
-                    return "active", None
+                avg = float(order.get("average") or order.get("price") or 0)
+                if expected is not None and expected > 0 and amount > expected * (1 + 1e-8):
+                    oversized.append({"leg": name, "amount": amount, "expected": expected})
+                if is_open or status not in TERMINAL:
+                    open_legs.append(name)
+                    if filled > 0:
+                        partials.append({"leg": name, "qty": filled, "price": avg,
+                                         "proceeds": self._leg_proceeds(order, filled, avg), "full": False})
+                    continue
                 if filled > 0:
-                    avg = float(order.get("average") or order.get("price") or 0)
-                    proceeds = float(order.get("cost") or filled * avg)
-                    for fee in order.get("fees") or ([order["fee"]] if order.get("fee") else []):
-                        if fee and fee.get("currency") == self.quote:
-                            proceeds -= float(fee.get("cost") or 0)
-                    legs.append({"leg": name, "qty": filled, "price": avg, "proceeds": proceeds,
-                                 "full": amount > 0 and filled >= amount * (1 - 1e-8)})
-            if not legs:
-                return "gone_confirmed", None
-            leg = next((x for x in legs if x["full"]), legs[0])
-            return ("filled" if leg["full"] else "partial"), leg
+                    leg = {"leg": name, "qty": filled, "price": avg,
+                           "proceeds": self._leg_proceeds(order, filled, avg),
+                           "full": amount > 0 and filled >= amount * (1 - 1e-8)}
+                    (filled_legs if leg["full"] else partials).append(leg)
+            if oversized:
+                return "oversized", oversized[0]
+            if len(filled_legs) > 1:
+                # OCO tidak boleh mengisi dua leg sekaligus: kalau terjadi, kuantitas terjual
+                # melebihi posisi dan PnL yang bisa dihitung dari state tidak lagi lengkap.
+                return "conflict", {"leg": "+".join(x["leg"] for x in filled_legs),
+                                    "qty": sum(x["qty"] for x in filled_legs),
+                                    "price": filled_legs[0]["price"],
+                                    "proceeds": sum(x["proceeds"] for x in filled_legs), "full": True}
+            if partials:
+                return "partial", partials[0]
+            if filled_legs:
+                return "filled", filled_legs[0]
+            if open_legs:
+                return "active", None
+            return "gone_confirmed", None
         except Exception:
             return "unknown", None
 
@@ -491,13 +527,13 @@ class Bot:
                 self.event("ERROR", f"{symbol}: pending order/OCO membutuhkan rekonsiliasi manual")
                 continue
             if pos.get("oco"):
-                status, _ = self.broker.poll_oco(symbol, pos["oco"])
-                if status == "unknown":
-                    pos["oco_pending"] = True
-                    pos["reconciliation_required"] = True
-                    st["reconciliation_required"] = True
-                    st["status"] = "reconciliation"
-                    self.event("ERROR", f"{symbol}: status OCO tidak dapat dipastikan")
+                status, result = self.broker.poll_oco(symbol, pos["oco"], pos.get("qty"))
+                if status in ("unknown", "oversized", "conflict", "partial"):
+                    reason = {"unknown": "status OCO tidak dapat dipastikan",
+                              "oversized": "kuantitas leg OCO melebihi posisi",
+                              "conflict": "kedua leg OCO terisi",
+                              "partial": "OCO terisi sebagian"}[status]
+                    self.fail_closed(symbol, st, f"{reason} saat start")
                 continue
             try:
                 tracked = float(pos["qty"])
@@ -551,22 +587,36 @@ class Bot:
         else:
             self.scan_entry(symbol, st, now)
 
+    def fail_closed(self, symbol: str, st: dict, message: str):
+        """Kunci pair ke rekonsiliasi manual: OCO/posisi tidak lagi bisa dipastikan."""
+        pos = st.get("position")
+        if isinstance(pos, dict):
+            pos["oco_pending"] = True
+            pos["reconciliation_required"] = True
+        st["reconciliation_required"] = True
+        st["status"] = "reconciliation"
+        self.event("ERROR", f"{symbol}: {message}")
+        self.save()
+
     def check_exit(self, symbol: str, st: dict, now: float):
         pos = st["position"]
         if pos.get("oco"):
             if now - self.last_oco_poll.get(symbol, 0) < 30:
                 return
             self.last_oco_poll[symbol] = now
-            status, result = self.broker.poll_oco(symbol, pos["oco"])
+            status, result = self.broker.poll_oco(symbol, pos["oco"], pos.get("qty"))
             if status == "active":
                 return
             if status == "unknown":
-                pos["reconciliation_required"] = True
-                pos["oco_pending"] = True
-                st["reconciliation_required"] = True
-                st["status"] = "reconciliation"
-                self.event("ERROR", f"OCO {symbol}: status tidak dapat dipastikan; perlu rekonsiliasi")
-                self.save()
+                self.fail_closed(symbol, st, "status OCO tidak dapat dipastikan; perlu rekonsiliasi")
+                return
+            if status == "oversized" and result:
+                self.fail_closed(symbol, st, f"leg {result['leg']} berukuran {result['amount']:g} melebihi "
+                                             f"posisi {result['expected']:g}; berpotensi menjual melebihi saldo")
+                return
+            if status == "conflict" and result:
+                self.fail_closed(symbol, st, f"kedua leg OCO terisi ({result['qty']:g} unit); saldo base "
+                                             "dan PnL perlu direkonsiliasi manual")
                 return
             if status == "gone_confirmed":
                 pos["oco"] = None
@@ -604,6 +654,10 @@ class Bot:
         self.exit_market(symbol, st, reason, mark, now)
 
     def arm_oco(self, symbol: str, st: dict, pos: dict):
+        if float(pos.get("qty") or 0) <= 0:
+            # OCO tanpa kuantitas akan ditolak exchange atau, lebih buruk, tidak melindungi apa pun.
+            self.fail_closed(symbol, st, "kuantitas posisi nol; OCO tidak dipasang")
+            return False
         attempt = int(pos.get("oco_attempts", 0)) + 1
         pos["oco_attempts"] = attempt
         cid = "rsi-oco-" + uuid.uuid4().hex[:20]
@@ -794,10 +848,7 @@ class Bot:
         atr = atr_pct(series, current_price=price)
         tp_pct = round(min(self.cfg.tp_max, max(self.cfg.tp_min, (atr or 0) * self.cfg.tp_atr)), 2)
         quote_free = self.broker.quote_free()
-        equity = quote_free
-        for pair, state in self.state["symbols"].items():
-            if state.get("position"):
-                equity += float(state["position"]["qty"]) * self.price(pair)
+        equity = self.tradable_equity(quote_free)
         cost = equity * self.cfg.position_pct / 100
         minimum = ((self.ex.market(symbol).get("limits") or {}).get("cost") or {}).get("min") or 0
         if cost > quote_free:
@@ -861,6 +912,21 @@ class Bot:
                     return None
         return None
 
+    def tradable_equity(self, quote_free=None) -> float:
+        """Modal dasar sizing: quote bebas + nilai mark posisi bot.
+
+        Berbeda dari `portfolio_snapshot["equity"]`, yaitu mark-to-market SELURUH akun termasuk
+        aset yang tidak pernah disentuh strategi. Sizing harus memakai angka ini: memakai equity
+        akun akan membuka posisi dari saldo yang bukan modal bot, dan pada akun yang menyimpan
+        aset lain selisihnya bisa berkali-kali lipat.
+        """
+        total = float(self.broker.quote_free()) if quote_free is None else float(quote_free)
+        for pair, st in self.state["symbols"].items():
+            pos = st.get("position")
+            if pos:
+                total += float(pos["qty"]) * self.price(pair)
+        return total
+
     def update_portfolio(self):
         """Snapshot portofolio read-only untuk dashboard. Tidak pernah mengirim order."""
         now = time.time()
@@ -905,6 +971,7 @@ class Bot:
             totals = balance.get("total") or {}
             frees = balance.get("free") or {}
             useds = balance.get("used") or {}
+            quote_free = float(frees.get(self.cfg.quote) or 0.0)
             equity = 0.0
             for asset in sorted(totals):
                 amount = float(totals.get(asset) or 0.0)
@@ -925,6 +992,12 @@ class Bot:
         self.state["portfolio_snapshot"] = {
             "updated_at": now, "mode": self.state.get("bot_mode", "unknown"), "quote": self.cfg.quote,
             "valuation": valuation, "equity": equity,
+            # Dua angka ini tidak boleh tertukar: equity untuk laporan akun, tradable_equity
+            # untuk POSITION_PCT. Nilainya sama hanya bila akun tidak punya aset lain.
+            "tradable_equity": quote_free + sum(float(row["value"]) for row in positions
+                                                if row["value"] is not None),
+            "quote_free": quote_free,
+            "position_pct": self.cfg.position_pct,
             "unrealized_pnl": sum(float(row["unrealized_pnl"]) for row in positions if row["unrealized_pnl"] is not None),
             "realized_pnl": float(self.state.get("realized_pnl") or 0.0),
             "realized_tracking_since": self.state.get("realized_tracking_since"),

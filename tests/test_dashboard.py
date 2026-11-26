@@ -241,3 +241,36 @@ def test_status_payload_exposes_state_file_and_staleness(monkeypatch):
 def test_page_warns_when_snapshot_is_stale():
     assert "SNAPSHOT BASI" in dashboard.PAGE
     assert "d.state_file" in dashboard.PAGE
+
+def test_page_defines_cards_before_first_use():
+    """Regresi: `cards` sempat dipakai tanpa definisi, membuat halaman gagal render di browser."""
+    page = dashboard.PAGE
+    assert "const cards=[" in page
+    assert page.index("const cards=[") < page.index("cards.map")
+
+
+def test_page_separates_account_and_sizing_equity():
+    page = dashboard.PAGE
+    assert "Equity akun" in page
+    assert "Modal sizing" in page
+    assert "p.tradable_equity" in page
+    assert "POSITION_PCT" in page
+
+
+def test_page_javascript_parses(tmp_path):
+    """Validasi sintaks seluruh inline script; ReferenceError seperti `cards` tidak terdeteksi pytest biasa."""
+    import re
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node tidak tersedia")
+
+    scripts = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", dashboard.PAGE, re.S)
+    assert scripts, "halaman harus punya minimal satu inline script"
+    target = tmp_path / "page.js"
+    target.write_text("\n".join(scripts), encoding="utf-8")
+
+    hasil = subprocess.run([node, "--check", str(target)], capture_output=True, text=True, timeout=60)
+    assert hasil.returncode == 0, hasil.stderr[-2000:]

@@ -420,6 +420,10 @@ def test_update_portfolio_dry_run_writes_dashboard_snapshot(tmp_path, monkeypatc
     assert snapshot["unpriced_assets"] == []
     assert snapshot["rate_limit_events"] == 0
     assert snapshot["realized_tracking_since"] is not None
+    # Dry run: akun kertas hanya berisi quote + posisi bot, jadi kedua angka sama.
+    assert snapshot["tradable_equity"] == pytest.approx(400.0 + 610.0)
+    assert snapshot["quote_free"] == pytest.approx(400.0)
+    assert snapshot["position_pct"] == pytest.approx(cfg.position_pct)
 
 
 def test_exchange_credentials_never_sent_in_dry_run(monkeypatch):
@@ -486,8 +490,11 @@ def test_partial_oco_fill_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("STATE_FILE", str(tmp_path / "state.json"))
     cfg = Config.from_env()
 
+    dipanggil = []
+
     class Broker:
-        def poll_oco(self, symbol, oco):
+        def poll_oco(self, symbol, oco, expected_qty=None):
+            dipanggil.append(expected_qty)
             return "partial", {"leg": "TP", "qty": 0.004, "price": 63000.0, "proceeds": 251.6, "full": False}
 
     state = new_state(cfg.state_file, cfg)
@@ -507,6 +514,7 @@ def test_partial_oco_fill_fails_closed(tmp_path, monkeypatch):
     assert symbol_state["position"]["qty"] == 0.01
     assert symbol_state["position"]["oco"] is not None
     assert any("fill parsial" in event["message"] for event in state["events"])
+    assert dipanggil == [0.01], "kuantitas posisi harus dikirim ke poll_oco sebagai pembanding leg OCO"
 
 def test_save_restricts_state_permissions_before_replace(tmp_path, monkeypatch):
     """State memuat saldo/posisi/order: file pengganti tidak boleh mewarisi 0644."""
@@ -596,3 +604,172 @@ def test_rsi_warmup_constant_matches_documented_value():
     from bot import RSI_WARMUP
 
     assert RSI_WARMUP == 200
+
+def _oco_exchange(open_orders, orders):
+    """Exchange palsu: fetch_open_orders + fetch_order untuk dua leg OCO."""
+
+    class Exchange:
+        def fetch_open_orders(self, symbol):
+            return [dict(order) for order in open_orders]
+
+        def fetch_order(self, order_id, symbol):
+            if order_id not in orders:
+                raise RuntimeError("Order does not exist")
+            return dict(orders[order_id])
+
+    return Exchange()
+
+
+def test_poll_oco_flags_leg_larger_than_position():
+    """Leg OCO yang lebih besar dari posisi bisa menjual melebihi saldo base."""
+    exchange = _oco_exchange(
+        [{"id": "11", "amount": 0.02, "filled": 0.0, "price": 63000.0, "status": "open"}],
+        {"12": {"id": "12", "amount": 0.02, "filled": 0.0, "price": 58500.0, "status": "open"}},
+    )
+    broker = LiveBroker(exchange, "USDT")
+
+    status, result = broker.poll_oco("BTC/USDT", {"tp_id": "11", "sl_id": "12"}, 0.01)
+
+    assert status == "oversized"
+    assert result["amount"] == 0.02 and result["expected"] == 0.01
+    assert result["leg"] in ("TP", "SL")
+
+
+def test_poll_oco_detects_partial_fill_while_leg_still_open():
+    """Fill parsial pada leg yang masih terbuka tidak boleh terlihat seperti 'active'."""
+    exchange = _oco_exchange(
+        [{"id": "11", "amount": 1.0, "filled": 0.3, "average": 63000.0, "price": 63000.0, "status": "open"}],
+        {"12": {"id": "12", "amount": 1.0, "filled": 0.0, "price": 58500.0, "status": "open"}},
+    )
+    broker = LiveBroker(exchange, "USDT")
+
+    status, result = broker.poll_oco("BTC/USDT", {"tp_id": "11", "sl_id": "12"}, 1.0)
+
+    assert status == "partial"
+    assert result["leg"] == "TP" and result["qty"] == pytest.approx(0.3)
+    assert result["full"] is False
+
+
+def test_poll_oco_flags_both_legs_filled():
+    exchange = _oco_exchange(
+        [],
+        {"11": {"id": "11", "amount": 1.0, "filled": 1.0, "average": 63000.0, "status": "closed"},
+         "12": {"id": "12", "amount": 1.0, "filled": 1.0, "average": 58500.0, "status": "closed"}},
+    )
+    broker = LiveBroker(exchange, "USDT")
+
+    status, result = broker.poll_oco("BTC/USDT", {"tp_id": "11", "sl_id": "12"}, 1.0)
+
+    assert status in ("conflict", "oversized")
+    assert result is not None
+
+
+def test_poll_oco_prefers_oversized_over_filled():
+    """Satu leg penuh + leg lain kebesaran: jangan langsung catat exit, rekonsiliasi dulu."""
+    exchange = _oco_exchange(
+        [{"id": "12", "amount": 3.0, "filled": 0.0, "price": 58500.0, "status": "open"}],
+        {"11": {"id": "11", "amount": 1.0, "filled": 1.0, "average": 63000.0, "cost": 63000.0, "status": "closed"}},
+    )
+    broker = LiveBroker(exchange, "USDT")
+
+    status, _ = broker.poll_oco("BTC/USDT", {"tp_id": "11", "sl_id": "12"}, 1.0)
+
+    assert status == "oversized"
+
+
+def test_poll_oco_keeps_active_and_gone_paths():
+    aktif = LiveBroker(_oco_exchange(
+        [{"id": "11", "amount": 1.0, "filled": 0.0, "price": 63000.0, "status": "open"}],
+        {"12": {"id": "12", "amount": 1.0, "filled": 0.0, "price": 58500.0, "status": "open"}},
+    ), "USDT")
+    assert aktif.poll_oco("BTC/USDT", {"tp_id": "11", "sl_id": "12"}, 1.0) == ("active", None)
+
+    hilang = LiveBroker(_oco_exchange(
+        [],
+        {"11": {"id": "11", "amount": 1.0, "filled": 0.0, "status": "canceled"},
+         "12": {"id": "12", "amount": 1.0, "filled": 0.0, "status": "canceled"}},
+    ), "USDT")
+    assert hilang.poll_oco("BTC/USDT", {"tp_id": "11", "sl_id": "12"}, 1.0) == ("gone_confirmed", None)
+
+
+def test_check_exit_oversized_leg_fails_closed(tmp_path, monkeypatch):
+    import time
+
+    from bot import Bot, Notifier, new_state
+
+    monkeypatch.setenv("SYMBOLS", "BTC/USDT")
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("BINANCE_API_KEY", "key")
+    monkeypatch.setenv("BINANCE_API_SECRET", "secret")
+    monkeypatch.setenv("STATE_FILE", str(tmp_path / "state.json"))
+    cfg = Config.from_env()
+
+    class Broker:
+        def poll_oco(self, symbol, oco, expected_qty=None):
+            return "oversized", {"leg": "SL", "amount": 0.02, "expected": 0.01}
+
+    state = new_state(cfg.state_file, cfg)
+    symbol_state = state["symbols"]["BTC/USDT"]
+    symbol_state["status"] = "in_position"
+    symbol_state["position"] = {"qty": 0.01, "entry": 60000.0, "cost": 600.0, "tp": 63000.0, "sl": 58500.0,
+                                "oco": {"list_id": "1", "client_list_id": "cid", "tp_id": "11", "sl_id": "12"}}
+    bot = Bot(cfg, None, Broker(), Notifier("", ""), state)
+
+    bot.check_exit("BTC/USDT", symbol_state, time.time())
+
+    assert symbol_state["status"] == "reconciliation"
+    assert symbol_state["reconciliation_required"] is True
+    assert symbol_state["position"]["reconciliation_required"] is True
+    assert symbol_state["position"]["oco"] is not None
+    assert any("melebihi posisi" in event["message"] for event in state["events"])
+
+def test_portfolio_snapshot_separates_account_equity_from_sizing_equity(tmp_path, monkeypatch):
+    """Regresi M6: equity akun (semua aset) dan modal sizing (quote bebas + posisi bot) berbeda.
+
+    Sizing memakai `tradable_equity`. Bila dashboard hanya menampilkan equity akun, operator
+    mengira POSITION_PCT dihitung dari seluruh saldo, padahal tidak.
+    """
+    from bot import Bot, Notifier, new_state
+
+    monkeypatch.setenv("SYMBOLS", "BTC/USDT")
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("BINANCE_API_KEY", "key")
+    monkeypatch.setenv("BINANCE_API_SECRET", "secret")
+    monkeypatch.setenv("STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setenv("POSITION_PCT", "30")
+    cfg = Config.from_env()
+
+    class Broker:
+        def fetch_balance(self):
+            return {"total": {"USDT": 100.0, "BTC": 1.0}, "free": {"USDT": 100.0, "BTC": 1.0}, "used": {}}
+
+        def quote_free(self):
+            return 100.0
+
+    state = new_state(cfg.state_file, cfg)
+    state["symbols"]["BTC/USDT"]["position"] = {"qty": 2.0, "entry": 8.0, "cost": 16.0,
+                                                "tp": 12.0, "sl": 7.0}
+    bot = Bot(cfg, None, Broker(), Notifier("", ""), state)
+    bot.price = lambda symbol, *a, **k: 10.0            # mark semua pair
+    bot.asset_value = lambda asset, amount: 50000.0 if asset == "BTC" else amount
+
+    bot.update_portfolio()
+    snapshot = state["portfolio_snapshot"]
+
+    assert snapshot["equity"] == pytest.approx(100.0 + 50000.0), "equity = seluruh akun, mark-to-market"
+    assert snapshot["tradable_equity"] == pytest.approx(100.0 + 2.0 * 10.0), "sizing = quote bebas + posisi bot"
+    assert snapshot["tradable_equity"] < snapshot["equity"]
+    assert snapshot["quote_free"] == pytest.approx(100.0)
+    assert bot.tradable_equity() == pytest.approx(120.0), "scan_entry harus memakai angka yang sama"
+
+
+def test_requirements_are_pinned():
+    """Regresi M7: rentang >= membuat deploy ulang menarik versi ccxt yang belum diuji."""
+    from pathlib import Path
+
+    lines = [line.strip() for line in Path("requirements.txt").read_text(encoding="utf-8").splitlines()]
+    paket = [line for line in lines if line and not line.startswith("#")]
+    assert paket, "requirements.txt tidak boleh kosong"
+    for line in paket:
+        assert "==" in line, line + " harus dipin ke versi eksak"
+        assert ">=" not in line and "~=" not in line, line + " masih memakai rentang"
